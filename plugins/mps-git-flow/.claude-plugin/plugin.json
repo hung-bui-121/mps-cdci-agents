@@ -1,0 +1,9 @@
+{
+  "name": "mps-git-flow",
+  "version": "0.1.0",
+  "description": "Commit & push code lên GitLab MPS (git-gst.mto.zing.vn) theo quy trình ticket Jira (jira-mps.mto.zing.vn): ticket, nhánh, review phạm vi, commit, push, merge request, cập nhật trạng thái Jira.",
+  "author": {
+    "name": "hung-bui-121"
+  },
+  "keywords": ["git", "gitlab", "jira", "merge-request", "mps"]
+}
