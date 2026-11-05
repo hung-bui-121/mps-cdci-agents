@@ -577,36 +577,53 @@ class BranchContextTests(unittest.TestCase):
 class GeneratedFilesTests(unittest.TestCase):
     """Tool-generated files (Unity) never make the current branch 'hold work' for phase pinning."""
 
-    DEFAULTS = mps.DEFAULT_GENERATED_PATTERNS
+    UNITY_AT_ROOT = mps.generated_rules([""], [])
 
-    def test_default_patterns(self):
+    def test_default_patterns_at_the_unity_root(self):
         generated = ["ProjectSettings/ProjectSettings.asset", "ProjectSettings/Sub/Deep.asset",
                      "Packages/packages-lock.json", "UserSettings/EditorUserSettings.asset", "Game.csproj",
                      "Assembly-CSharp.csproj", "Game.sln", "Library/ScriptAssemblies/x.dll"]
         for path in generated:
-            self.assertTrue(mps.is_generated_path(path, self.DEFAULTS), path)
+            self.assertTrue(mps.is_generated_path(path, self.UNITY_AT_ROOT), path)
         real = ["Assets/Scripts/Login.cs", "Packages/manifest.json", "Docs/ProjectSettings.md",
                 "ProjectSettingsBackup/x.asset", "src/Game.csproj.bak", "LibraryCode/a.cs"]
         for path in real:
-            self.assertFalse(mps.is_generated_path(path, self.DEFAULTS), path)
+            self.assertFalse(mps.is_generated_path(path, self.UNITY_AT_ROOT), path)
 
-    def test_windows_paths_and_nested_unity_project(self):
-        self.assertTrue(mps.is_generated_path("ProjectSettings\\TagManager.asset", self.DEFAULTS))
-        self.assertTrue(mps.is_generated_path("Client/Game/ProjectSettings/TagManager.asset", self.DEFAULTS))
-        self.assertTrue(mps.is_generated_path("Client\\Game\\Packages\\packages-lock.json", self.DEFAULTS))
-        self.assertTrue(mps.is_generated_path("Client/Game/Game.csproj", self.DEFAULTS))
-        self.assertFalse(mps.is_generated_path("Client/Game/Assets/a.cs", self.DEFAULTS))
+    def test_patterns_are_anchored_to_unity_roots(self):
+        """G1: a folder that merely has the same name deeper down is real work."""
+        for path in ("Assets/Plugins/Library/Core.cs", "Assets/Editor/ProjectSettings/Tool.cs",
+                     "Assets/Scripts/Game.csproj", "Tools/Build.sln"):
+            self.assertFalse(mps.is_generated_path(path, self.UNITY_AT_ROOT), path)
 
-    def test_extra_patterns_from_env(self):
-        patterns = mps.generated_patterns(" Assets/Gen/** , *.lock ,Assets\\AddressableAssetsData\\*.json,")
-        self.assertEqual(patterns[:len(self.DEFAULTS)], list(self.DEFAULTS))
-        self.assertEqual(patterns[len(self.DEFAULTS):],
-                         ["Assets/Gen/**", "*.lock", "Assets/AddressableAssetsData/*.json"])
-        self.assertTrue(mps.is_generated_path("Assets/Gen/a/b.cs", patterns))
-        self.assertTrue(mps.is_generated_path("yarn.lock", patterns))
-        self.assertTrue(mps.is_generated_path("Assets/AddressableAssetsData/settings.json", patterns))
-        self.assertFalse(mps.is_generated_path("Assets/AddressableAssetsData/Sub/settings.json", patterns))
-        self.assertEqual(mps.generated_patterns(None), list(self.DEFAULTS))
+    def test_nested_unity_project_and_windows_paths(self):
+        rules = mps.generated_rules(["Client/Game"], [])
+        self.assertTrue(mps.is_generated_path("Client/Game/ProjectSettings/TagManager.asset", rules))
+        self.assertTrue(mps.is_generated_path("Client\\Game\\Packages\\packages-lock.json", rules))
+        self.assertTrue(mps.is_generated_path("Client/Game/Game.csproj", rules))
+        self.assertFalse(mps.is_generated_path("Client/Game/Assets/a.cs", rules))
+        self.assertFalse(mps.is_generated_path("ProjectSettings/TagManager.asset", rules))  # repo root is not Unity
+        self.assertFalse(mps.is_generated_path("Server/Server.csproj", rules))
+
+    def test_no_unity_project_means_no_defaults(self):
+        rules = mps.generated_rules([], [])
+        self.assertEqual(rules, [])
+        self.assertFalse(mps.is_generated_path("Server.sln", rules))
+        self.assertFalse(mps.is_generated_path("ProjectSettings/x.asset", rules))
+
+    def test_user_patterns_are_validated(self):
+        """G2: wildcard-only or wildcard-first patterns are rejected."""
+        valid, rejected = mps.parse_generated_patterns(
+            " Assets/Gen/** , *, **, **/*, */**, /, *.lock, */Gen/**, ?x/y, yarn.lock, Assets\\Data\\*.json,")
+        self.assertEqual(valid, ["Assets/Gen/**", "yarn.lock", "Assets/Data/*.json"])
+        self.assertEqual(rejected, ["*", "**", "**/*", "*/**", "/", "*.lock", "*/Gen/**", "?x/y"])
+        self.assertEqual(mps.parse_generated_patterns(None), ([], []))
+        rules = mps.generated_rules([], valid)  # extra patterns apply even without a Unity project
+        self.assertTrue(mps.is_generated_path("Assets/Gen/a/b.cs", rules))
+        self.assertTrue(mps.is_generated_path("yarn.lock", rules))
+        self.assertFalse(mps.is_generated_path("web/yarn.lock", rules))
+        self.assertTrue(mps.is_generated_path("Assets/Data/settings.json", rules))
+        self.assertFalse(mps.is_generated_path("Assets/Data/Sub/settings.json", rules))
         self.assertIn("MPS_GENERATED_PATTERNS", mps.KNOWN_KEYS)
 
 
@@ -1260,8 +1277,16 @@ class GitFlowTests(unittest.TestCase):
 
     # -- generated files and phase pinning ----------------------------------
 
+    def make_unity_project(self, folder=""):
+        """Commit ProjectSettings/ProjectVersion.txt (marks a Unity project root) on the current branch and push."""
+        self.write(os.path.join(folder, "ProjectSettings", "ProjectVersion.txt"), "m_EditorVersion: 2022.3.0f1\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "chore: unity project")
+        self.git("push", "-q", "origin", "HEAD")
+
     def test_generated_files_do_not_pin_the_phase(self):
         self.git("switch", "-q", "release/1.0")
+        self.make_unity_project()
         self.write("ProjectSettings/ProjectSettings.asset", "unity rewrote this\n")
         self.write("Game.csproj", "<Project/>\n")
         plan = self.plan("--type=bug", "--key=MPS-30", "--phase=dev")
@@ -1279,15 +1304,66 @@ class GitFlowTests(unittest.TestCase):
         uncommitted, _ = mps.review_candidates(self.repo, "origin/release/1.0")
         self.assertIn("ProjectSettings/ProjectSettings.asset", uncommitted)
 
+    def test_folder_named_like_generated_one_is_real_work(self):
+        """G1: Assets/Plugins/Library/Core.cs is code, not Unity's Library/ folder."""
+        self.git("switch", "-q", "release/1.0")
+        self.make_unity_project()
+        self.write("Assets/Plugins/Library/Core.cs", "class Core {}\n")
+        conflict = self.plan("--type=bug", "--key=MPS-32", "--phase=dev")
+        self.assertEqual((conflict["error"], conflict["generated_changes"]), ("phase_conflict", []))
+
+    def test_non_unity_repo_does_not_use_the_defaults(self):
+        self.git("switch", "-q", "release/1.0")
+        self.write("Server.sln", "solution\n")
+        self.write("ProjectSettings/x.asset", "not unity\n")
+        conflict = self.plan("--type=bug", "--key=MPS-33", "--phase=dev")
+        self.assertEqual((conflict["error"], conflict["generated_changes"]), ("phase_conflict", []))
+
+    def test_nested_unity_project_found_on_disk(self):
+        self.git("switch", "-q", "release/1.0")
+        # Untracked version file: the Unity root is found on disk, not only through git.
+        self.write("Client/Game/ProjectSettings/ProjectVersion.txt", "m_EditorVersion: 2022.3.0f1\n")
+        self.write("Client/Game/ProjectSettings/TagManager.asset", "tags\n")
+        self.write("Client/Game/Game.csproj", "<Project/>\n")
+        plan = self.plan("--type=bug", "--key=MPS-34", "--phase=dev")
+        self.assertEqual(plan["phase_source"], "requested_clean_tree")
+        self.assertEqual(sorted(plan["generated_changes"]),
+                         ["Client/Game/Game.csproj", "Client/Game/ProjectSettings/ProjectVersion.txt",
+                          "Client/Game/ProjectSettings/TagManager.asset"])
+        self.write("Client/Server.csproj", "<Project/>\n")  # outside the Unity root: real work
+        self.assertEqual(self.plan("--type=bug", "--key=MPS-34", "--phase=dev")["error"], "phase_conflict")
+
     def test_generated_patterns_from_env(self):
-        self.write(".env", "MPS_GENERATED_PATTERNS=Assets/Gen/**\n")  # untracked .env never counts as work
+        self.write(".env", "MPS_GENERATED_PATTERNS=Assets/Gen/**,*\n")  # untracked .env never counts as work
         self.git("switch", "-q", "release/1.0")
         self.write("Assets/Gen/Bindings.cs", "// generated\n")
         plan = self.plan("--type=bug", "--key=MPS-31", "--phase=dev")
         self.assertEqual((plan["phase_source"], plan["generated_changes"]),
                          ("requested_clean_tree", ["Assets/Gen/Bindings.cs"]))
-        self.assertEqual(self.mps("env", "set", "MPS_GENERATED_PATTERNS", "Assets/Gen/**,*.lock")["key"],
-                         "MPS_GENERATED_PATTERNS")
+        self.assertEqual([(w["code"], w["patterns"]) for w in plan["warnings"]],
+                         [("invalid_generated_pattern", ["*"])])
+        # G2: the rejected '*' does not hide real work.
+        self.write("src/fix.cs", "class Fix {}\n")
+        conflict = self.plan("--type=bug", "--key=MPS-31", "--phase=dev")
+        self.assertEqual(conflict["error"], "phase_conflict")
+        self.assertEqual(conflict["warnings"][0]["code"], "invalid_generated_pattern")
+        # Only the user edits this key, by hand.
+        refused = self.mps("env", "set", "MPS_GENERATED_PATTERNS", "*")
+        self.assertEqual(refused["error"], "manual_edit_required")
+        self.assertNotIn("MPS_GENERATED_PATTERNS", self.mps("env", "set", "FOO", "x")["allowed_keys"])
+
+    def test_closed_unmerged_branch_counts_again(self):
+        """m1: pushed but never merged (MR closed, branch deleted) -> still unpushed work."""
+        self.prepare("feature/MPS-35-a", "MPS-35")
+        self.write("a.txt", "a\n")
+        self.approve(["a.txt"])
+        self.commit("feat: MPS-35 a", "a.txt")
+        self.mps("git", "push", "--branch=feature/MPS-35-a", "--base=develop")
+        self.git("push", "-q", "origin", "--delete", "feature/MPS-35-a")
+        self.git("fetch", "-q", "--prune")
+        self.assertEqual(mps.unpushed_commit_count(self.repo), 1)
+        refused = self.prepare("feature/MPS-36-b", "MPS-36")
+        self.assertEqual((refused["error"], refused["count"]), ("local_commits_not_carried", 1))
 
 
 if __name__ == "__main__":

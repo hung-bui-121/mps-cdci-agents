@@ -78,6 +78,9 @@ KNOWN_KEYS = (
 DEFAULT_GENERATED_PATTERNS = (
     "ProjectSettings/**", "Packages/packages-lock.json", "UserSettings/**", "*.csproj", "*.sln", "Library/**",
 )
+UNITY_VERSION_FILE = "ProjectSettings/ProjectVersion.txt"
+# Keys the user must edit by hand in .env (env set refuses them): tokens, and patterns that relax phase pinning.
+MANUAL_ONLY_KEYS = (KEY_GENERATED_PATTERNS,)
 REQUIRED_CONNECTION_KEYS = (KEY_JIRA_URL, KEY_JIRA_PAT, KEY_GITLAB_URL, KEY_GITLAB_PAT)
 DEFAULTS = {
     KEY_JIRA_URL: "https://jira-mps.mto.zing.vn",
@@ -584,10 +587,42 @@ def scan_secrets(diff_text):
     return findings
 
 
-def generated_patterns(extra):
-    """Default generated-file globs plus the comma-separated MPS_GENERATED_PATTERNS value."""
-    added = [p.strip().replace("\\", "/") for p in (extra or "").split(",") if p.strip()]
-    return list(DEFAULT_GENERATED_PATTERNS) + [p for p in added if p not in DEFAULT_GENERATED_PATTERNS]
+_WILDCARD_CHARS = ("*", "?", "[")
+
+
+def is_valid_generated_pattern(pattern):
+    """A user pattern must start with a literal folder or file name ('Assets/Gen/**', 'yarn.lock').
+
+    Wildcard-only or wildcard-first patterns ('*', '**/*', '*/Gen/**', '*.cs') would hide real work from phase
+    pinning, so they are rejected.
+    """
+    segments = [s for s in pattern.strip("/").split("/") if s]
+    return bool(segments) and not any(ch in segments[0] for ch in _WILDCARD_CHARS)
+
+
+def parse_generated_patterns(extra):
+    """MPS_GENERATED_PATTERNS (comma-separated) -> (valid normalized patterns, rejected patterns as written)."""
+    valid = []
+    rejected = []
+    for raw in (p.strip() for p in (extra or "").split(",")):
+        if not raw:
+            continue
+        normalized = raw.replace("\\", "/").strip("/")
+        if is_valid_generated_pattern(normalized):
+            valid.append(normalized)
+        else:
+            rejected.append(raw)
+    return valid, rejected
+
+
+def generated_rules(unity_roots, extra_patterns):
+    """[(pattern, roots)]: Unity defaults apply inside Unity project roots only (none -> not applied at all);
+    the user's extra patterns apply from the repo root ("") and from every Unity project root."""
+    roots = tuple(sorted(set(unity_roots)))
+    rules = [(p, roots) for p in DEFAULT_GENERATED_PATTERNS] if roots else []
+    extra_roots = tuple(sorted(set(("",) + roots)))
+    rules.extend((p, extra_roots) for p in extra_patterns)
+    return rules
 
 
 def _glob_regex(pattern):
@@ -610,23 +645,29 @@ def _glob_regex(pattern):
     return re.compile("^" + "".join(parts) + "$")
 
 
-def is_generated_path(path, patterns):
-    """True if `path` matches a generated-file glob.
+def _relative_to(path, root):
+    if not root:
+        return path
+    prefix = root + "/"
+    return path[len(prefix):] if path.startswith(prefix) else None
 
-    A pattern without '/' (e.g. '*.csproj') matches the file name anywhere; a pattern with '/' matches from the repo
-    root or from any folder inside it, so a Unity project in a sub-folder ('Game/ProjectSettings/x.asset') counts.
+
+def is_generated_path(path, rules):
+    """True if `path` matches a rule from `generated_rules`.
+
+    Patterns are anchored to their roots: 'ProjectSettings/**' matches '<unity root>/ProjectSettings/...' but not
+    'Assets/Plugins/ProjectSettings/x.cs'. A pattern without '/' ('*.csproj') matches only files directly inside
+    one of its roots (where Unity writes them).
     """
     normalized = (path or "").replace("\\", "/").strip("/")
-    segments = normalized.split("/")
-    for pattern in patterns:
-        glob = pattern.replace("\\", "/").strip("/")
-        regex = _glob_regex(glob)
-        if "/" not in glob:
-            if regex.match(segments[-1]):
+    for pattern, roots in rules:
+        regex = _glob_regex(pattern.replace("\\", "/").strip("/"))
+        for root in roots:
+            relative = _relative_to(normalized, root.replace("\\", "/").strip("/"))
+            if relative is None or ("/" not in pattern and "/" in relative):
+                continue
+            if regex.match(relative):
                 return True
-            continue
-        if any(regex.match("/".join(segments[start:])) for start in range(len(segments))):
-            return True
     return False
 
 
@@ -1497,17 +1538,40 @@ def unstage(root, paths):
 
 
 def unpushed_commit_count(root):
-    """Commits reachable from HEAD that are on no origin branch and were never pushed by this skill.
+    """Commits reachable from HEAD that are on no origin branch, minus pushed work that already landed.
 
-    After a squash-merge GitLab deletes the ticket branch and `fetch --prune` drops origin/<branch>; its commits
-    are then on no remote ref although they were pushed. The last pushed commit recorded per branch
-    (`branch.<name>.mps-pushed`) keeps them from counting as unpushed work. 0 before the first commit.
+    After a (squash-)merge GitLab deletes the ticket branch and `fetch --prune` drops origin/<branch>; its commits
+    are then on no remote ref. The commits up to the last push (`branch.<name>.mps-pushed`) are exempt, but only
+    when their changes are really in origin/<recorded base>: an MR closed without merging must still count, or
+    the work would be left behind silently. 0 before the first commit.
     """
     if not head_exists(root):
         return 0
-    pushed = last_pushed_commit(root, current_branch(root))
-    args = ["rev-list", "--count", "HEAD", "--not", "--remotes=origin"] + ([pushed] if pushed else [])
+    branch = current_branch(root)
+    pushed = last_pushed_commit(root, branch)
+    exempt = [pushed] if pushed and pushed_work_landed(root, pushed, recorded_base(root, branch)) else []
+    args = ["rev-list", "--count", "HEAD", "--not", "--remotes=origin"] + exempt
     return int(run_git(args, root).stdout.strip() or 0)
+
+
+def pushed_work_landed(root, pushed, base):
+    """True if the changes up to `pushed` are already in origin/<base> (normal merge, rebase or squash-merge)."""
+    if not base or not ref_exists(root, "refs/remotes/origin/" + base):
+        return False
+    base_ref = "refs/remotes/origin/" + base
+    cherry = run_git(["cherry", base_ref, pushed], root).stdout
+    if not any(line.startswith("+") for line in cherry.splitlines()):
+        return True  # every commit has an equivalent patch upstream
+    merge_base = run_git(["merge-base", base_ref, pushed], root, check=False).stdout.strip()
+    if not merge_base:
+        return False
+    paths = [p for p in run_git(["diff", "--name-only", "-z", "--no-renames", merge_base, pushed], root).stdout
+             .split("\0") if p]
+    if not paths:
+        return True
+    # Squash-merge: one combined commit upstream, so compare the resulting content of every path the branch touched.
+    same = run_git(["diff", "--quiet", pushed, base_ref, "--"] + paths, root, check=False, literal_pathspecs=True)
+    return same.code == 0
 
 
 def git_identity(root):
@@ -1980,6 +2044,9 @@ def cmd_env_check(args):
         warnings.append({"code": "env_tracked", "message": "File .env đang bị git theo dõi (đã từng được commit). "
                                                            "Cần developer gỡ nó khỏi git (git rm --cached .env) "
                                                            "và đổi token mới."})
+    rejected_patterns = parse_generated_patterns(cfg.get(KEY_GENERATED_PATTERNS))[1]
+    if rejected_patterns:
+        warnings.append(invalid_generated_warning(rejected_patterns))
     missing = [k for k in REQUIRED_CONNECTION_KEYS if not cfg.get(k)]
     if missing:
         raise MpsError("missing_config", "File .env còn thiếu: %s. Hãy tự mở file .env bằng trình soạn thảo để điền "
@@ -2026,9 +2093,13 @@ def cmd_env_set(args):
     if key.endswith(SECRET_KEY_SUFFIX):
         raise MpsError("secret_key_refused", "Không ghi token qua lệnh này. Hãy tự mở file .env bằng trình soạn thảo "
                                              "để điền %s (không dán token vào chat)." % key)
+    if key in MANUAL_ONLY_KEYS:
+        raise MpsError("manual_edit_required", "%s chỉ do người dùng tự sửa trong file .env (nó ảnh hưởng việc chọn "
+                                               "giai đoạn), không ghi qua lệnh này." % key, key=key)
     if key not in KNOWN_KEYS:
         raise MpsError("unknown_key", "Khoá cấu hình không hợp lệ: %s." % key,
-                       allowed_keys=[k for k in KNOWN_KEYS if not k.endswith(SECRET_KEY_SUFFIX)])
+                       allowed_keys=[k for k in KNOWN_KEYS
+                                     if not k.endswith(SECRET_KEY_SUFFIX) and k not in MANUAL_ONLY_KEYS])
     value = args.value.strip()
     if "\n" in value or "\r" in value:
         raise MpsError("invalid_value", "Giá trị không được xuống dòng.")
@@ -2193,17 +2264,46 @@ def branch_context(root, branches, key=None):
                                  detached_at=detached_at)
 
 
-def work_in_progress(root, patterns):
+def unity_project_roots(root, paths):
+    """Folders ("" = repo root) holding a Unity project, i.e. containing ProjectSettings/ProjectVersion.txt.
+
+    Tracked version files are found through git; untracked ones are checked on disk for the folders of `paths`.
+    """
+    roots = set()
+    tracked = run_git(["ls-files", "-z", "--", ":(glob)**/" + UNITY_VERSION_FILE], root).stdout
+    for path in tracked.split("\0"):
+        if path.endswith(UNITY_VERSION_FILE):
+            roots.add(path[:-len(UNITY_VERSION_FILE)].strip("/"))
+    candidates = set([""])
+    for path in paths:
+        folders = path.split("/")[:-1]
+        candidates.update("/".join(folders[:depth]) for depth in range(len(folders) + 1))
+    for folder in candidates:
+        if os.path.isfile(os.path.join(root, folder, *UNITY_VERSION_FILE.split("/"))):
+            roots.add(folder)
+    return sorted(roots)
+
+
+def work_in_progress(root, extra_patterns):
     """(dirty, generated_changes) for phase pinning only.
 
-    Dirty = real uncommitted changes or commits on no origin branch. `.env` files and tool-generated files
-    (`patterns`, e.g. Unity's ProjectSettings) do not count; the generated ones are returned so the agent can
-    mention them. Committing is not affected: those files still go through the scope review.
+    Dirty = real uncommitted changes or commits on no origin branch. `.env` files and tool-generated files (the
+    Unity defaults inside Unity project roots, plus the user's valid MPS_GENERATED_PATTERNS) do not count; the
+    generated ones are returned so the agent can mention them. Committing is not affected: those files still go
+    through the scope review.
     """
     changed = [p for p in _changed_paths(git_status(root)) if not is_env_file(p)]
-    generated = [p for p in changed if is_generated_path(p, patterns)]
+    rules = generated_rules(unity_project_roots(root, changed), extra_patterns)
+    generated = [p for p in changed if is_generated_path(p, rules)]
     real = [p for p in changed if p not in generated]
     return bool(real) or unpushed_commit_count(root) > 0, generated
+
+
+def invalid_generated_warning(rejected):
+    return {"code": "invalid_generated_pattern", "patterns": rejected,
+            "message": "Bỏ qua mẫu MPS_GENERATED_PATTERNS không hợp lệ (phải bắt đầu bằng tên thư mục hoặc tên file cụ "
+                       "thể, không được chỉ là ký tự đại diện): %s. Người dùng tự sửa trong file .env."
+                       % ", ".join(rejected)}
 
 
 def cmd_flow_plan(args):
@@ -2216,14 +2316,16 @@ def cmd_flow_plan(args):
     if not fetched.ok:
         raise_git_network_error(fetched, "fetch")
     context = branch_context(root, branches, key)
-    dirty, generated = work_in_progress(root, generated_patterns(cfg.get(KEY_GENERATED_PATTERNS)))
+    extra_patterns, rejected_patterns = parse_generated_patterns(cfg.get(KEY_GENERATED_PATTERNS))
+    dirty, generated = work_in_progress(root, extra_patterns)
+    warnings = [invalid_generated_warning(rejected_patterns)] if rejected_patterns else []
     try:
         phase, phase_source, pinned = reconcile_phase(context, args.phase, dirty)
     except MpsError as exc:
         exc.extra.setdefault("generated_changes", generated)  # so the agent can still mention them
+        exc.extra.setdefault("warnings", warnings)
         raise
     plan = plan_phase(phase, args.type, branches)
-    warnings = []
     if context["recorded_base_gone"]:
         warnings.append({"code": "recorded_base_gone", "recorded_base": context["recorded_base"],
                          "message": "Nhánh %s được tạo từ %s nhưng %s không còn trên GitLab; nhánh này sẽ không được "
