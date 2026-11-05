@@ -94,6 +94,8 @@ BINARY_SNIFF_BYTES = 8192
 RELEASE_BRANCHES_REPORTED = 5
 FOREIGN_COMMITS_REPORTED = 10
 TMP_DIRNAME = "mps-tmp"
+BASE_CONFIG_NAME = "mps-base"
+SCOPE_FILENAME = "scope.json"
 STASH_MESSAGE = "mps-auto"
 REVIEW_BUNDLE_FILENAME = "mps-review.md"
 MIN_REDACT_LEN = 4
@@ -222,7 +224,7 @@ _ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
 def normalize_issue_key(key):
     normalized = (key or "").strip().upper()
     if not _ISSUE_KEY_RE.match(normalized):
-        raise MpsError("invalid_ticket_key", "Mã ticket Jira không hợp lệ: '%s'. Ví dụ đúng: MPS-123." % key)
+        raise MpsError("invalid_ticket_key", "Mã ticket Jira không hợp lệ: '%s'. Ví dụ đúng: MPS-123, ART-12." % key)
     return normalized
 
 
@@ -332,6 +334,116 @@ def plan_phase(phase, ticket_type, branches, access_level=None):
         plan["access_level_name"] = access_level_name(access_level)
     plan["naming_type"] = KIND_TO_NAMING_TYPE[plan["kind"]]
     return plan
+
+
+TICKET_BRANCH_PREFIXES = ("feature/", "bugfix/", "hotfix/")
+
+
+def phase_of_branch(name, branches):
+    """develop -> dev, release/* -> beta, master -> production, anything else -> None."""
+    if not name:
+        return None
+    if name == branches["dev"]:
+        return "dev"
+    if name == branches["prod"]:
+        return "production"
+    if name.startswith(branches["beta_prefix"]):
+        return "beta"
+    return None
+
+
+_TICKET_BRANCH_KEY_RE = re.compile(r"^(?:feature|bugfix|hotfix)/([A-Za-z][A-Za-z0-9_]*-[0-9]+)")
+
+
+def ticket_key_of_branch(branch):
+    """'bugfix/MPS-2-sua-loi' -> 'MPS-2' (None for non-ticket branches)."""
+    match = _TICKET_BRANCH_KEY_RE.match(branch or "")
+    return match.group(1).upper() if match else None
+
+
+def unique_protected_branch(remote_branches, branches):
+    """Of the origin branches pointing exactly at a detached HEAD, the single develop/master/release one, else None."""
+    protected = sorted(set(b for b in remote_branches if phase_of_branch(b, branches)))
+    return protected[0] if len(protected) == 1 else None
+
+
+def detect_branch_context(branch, branches, recorded_base, key=None, recorded_base_exists=True, detached_at=None):
+    """Where is the user working? The MR must go back into the branch the work started from.
+
+    branch None = detached HEAD; `detached_at` is then the unique protected origin branch pointing at HEAD.
+    A ticket branch pins its recorded base only when it belongs to the current ticket (`key`) and that base
+    still exists on origin.
+    """
+    context = {"current_branch": branch, "recorded_base": recorded_base,
+               "branch_ticket_key": ticket_key_of_branch(branch), "recorded_base_gone": False,
+               "detached": branch is None}
+    phase = None
+    base = None
+    if branch is None:
+        phase = phase_of_branch(detached_at, branches)
+        base = detached_at if phase else None
+        role = phase or "detached"
+    elif phase_of_branch(branch, branches):
+        role = phase = phase_of_branch(branch, branches)
+        base = branch
+    elif (branch.startswith(TICKET_BRANCH_PREFIXES) and phase_of_branch(recorded_base, branches)
+          and (key is None or context["branch_ticket_key"] == key)):
+        if recorded_base_exists:
+            role, phase, base = "ticket", phase_of_branch(recorded_base, branches), recorded_base
+        else:
+            role = "other"
+            context["recorded_base_gone"] = True
+    else:
+        role = "other"
+    context.update({"current_branch_role": role, "detected_phase": phase, "detected_base": base})
+    return context
+
+
+def reconcile_phase(context, requested, dirty):
+    """Return (phase, phase_source, pinned). Never silently moves changes made on one phase's branch elsewhere.
+
+    The current branch pins the phase only when work exists on it (changes or unpushed commits) or when it is the
+    current ticket's own branch. On a clean tree the user's requested phase wins.
+    """
+    detected = context["detected_phase"]
+    role = context["current_branch_role"]
+    if role == "detached" and dirty:
+        raise MpsError("detached_head", "Bạn đang có thay đổi nhưng không đứng trên nhánh nào (detached HEAD), nên không "
+                                        "biết thay đổi thuộc nhánh nào. Hãy nhờ developer giúp đưa thay đổi về đúng nhánh.")
+    if context.get("recorded_base_gone") and dirty:
+        raise MpsError("recorded_base_gone",
+                       "Nhánh %s được tạo từ %s nhưng nhánh %s không còn trên GitLab. Thay đổi đang dở trên nhánh này "
+                       "cần developer giúp chuyển sang đúng nhánh." % (
+                           context["current_branch"], context["recorded_base"], context["recorded_base"]),
+                       recorded_base=context["recorded_base"], current_branch=context["current_branch"])
+    pinned = bool(detected) and (role == "ticket" or dirty)
+    if pinned:
+        if requested and requested != detected:
+            raise MpsError("phase_conflict",
+                           "Bạn đang làm việc trên nhánh %s (giai đoạn %s) nhưng lại chọn giai đoạn %s. Thay đổi làm "
+                           "trên nhánh nào phải gộp về đúng nhánh đó; chuyển thay đổi sang giai đoạn khác cần developer "
+                           "giúp." % (context["current_branch"] or context["detected_base"], detected, requested),
+                           detected_phase=detected, requested_phase=requested, current_branch=context["current_branch"])
+        return detected, "detected", True
+    if requested:
+        return requested, ("requested_clean_tree" if detected else "requested"), False
+    raise MpsError("phase_required", "Chưa xác định được giai đoạn (nhánh hiện tại: %s, chưa có thay đổi nào gắn với "
+                                     "nhánh này). Hãy hỏi người dùng: dev, beta hay production."
+                   % (context["current_branch"] or "detached HEAD"),
+                   current_branch=context["current_branch"], current_branch_role=role, detected_phase=detected)
+
+
+def check_release_branch(current, ordered_names):
+    """The release branch the work is pinned to must still exist on GitLab; warn if it is not the newest one."""
+    if current not in ordered_names:
+        raise MpsError("release_branch_gone", "Nhánh beta %s không còn trên GitLab (có thể đã kết thúc và bị xoá). Không "
+                                              "thể tạo merge request vào nhánh này — hãy nhờ developer." % current,
+                       branch=current, release_branches=ordered_names[:RELEASE_BRANCHES_REPORTED])
+    if current == ordered_names[0]:
+        return None
+    return {"code": "not_latest_release", "latest": ordered_names[0], "branch": current,
+            "message": "Bạn đang làm trên %s, nhánh beta này vẫn còn trên GitLab nhưng không phải nhánh mới nhất (%s). MR "
+                       "sẽ vào đúng %s. Hãy xác nhận với người dùng đây là chủ ý." % (current, ordered_names[0], current)}
 
 
 def is_protected_branch(name, branches):
@@ -648,6 +760,78 @@ def apply_budget(texts, cap):
 
 
 # ---------------------------------------------------------------------------
+# Pure helpers: scope review result
+# ---------------------------------------------------------------------------
+
+REVIEW_CATEGORIES = ("in_scope", "out_of_scope", "mixed", "concern")
+COMMITTABLE_CATEGORIES = ("in_scope", "concern")
+_REVIEW_FILES_HEADER_RE = re.compile(r"^\s*FILES:\s*$")
+_REVIEW_FILE_LINE_RE = re.compile(r"^\s*[-*]?\s*(in_scope|out_of_scope|mixed|concern)\s*:\s*(.+?)\s*$")
+_REVIEW_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(PASS|FAIL)\s*$", re.MULTILINE)
+_TRAILING_NOTE_RE = re.compile(r"\s+\(.*\)$")
+
+
+def parse_review_files(text):
+    """Reviewer reply -> ([(category, raw_path)], verdict or None). Reads the lines after the `FILES:` header."""
+    entries = []
+    in_block = False
+    for line in (text or "").splitlines():
+        if _REVIEW_FILES_HEADER_RE.match(line):
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        match = _REVIEW_FILE_LINE_RE.match(line)
+        if match:
+            entries.append((match.group(1), match.group(2).strip("`")))
+    verdicts = _REVIEW_VERDICT_RE.findall(text or "")
+    return entries, (verdicts[-1] if verdicts else None)
+
+
+def _match_candidate(raw, candidates):
+    if raw in candidates:
+        return raw
+    stripped = _TRAILING_NOTE_RE.sub("", raw).strip("`")
+    return stripped if stripped in candidates else None
+
+
+def classify_review(entries, uncommitted, committed, verdict):
+    """Turn the reviewer's per-file list into commit decisions. Unclassified files are NEVER committed by default.
+
+    On a PASS verdict concern files are committed by default; otherwise only in_scope files are, and concern files
+    need the user's decision (`needs_decision`). A missing verdict makes the classification incomplete.
+    """
+    candidates = list(uncommitted) + [p for p in committed if p not in uncommitted]
+    by_path = {}
+    unknown = []
+    duplicates = []
+    for category, raw in entries:
+        path = _match_candidate(raw, candidates)
+        if path is None:
+            unknown.append(raw)
+        elif path in by_path:
+            duplicates.append(path)
+        else:
+            by_path[path] = category
+    committable = COMMITTABLE_CATEGORIES if verdict == "PASS" else ("in_scope",)
+    concern = [p for p in uncommitted if by_path.get(p) == "concern"]
+    return {
+        "verdict": verdict,
+        "commit_files": [p for p in uncommitted if by_path.get(p) in committable],
+        "concern_files": concern,
+        "needs_decision": [] if verdict == "PASS" else concern,
+        "excluded_files": [p for p in uncommitted if by_path.get(p) == "out_of_scope"],
+        "mixed_files": [p for p in uncommitted if by_path.get(p) == "mixed"],
+        "unclassified_files": [p for p in uncommitted if p not in by_path],
+        "committed_out_of_scope": [p for p in committed if by_path.get(p) in ("out_of_scope", "mixed")],
+        "unknown_paths": unknown,
+        "duplicate_paths": duplicates,
+        "complete": (verdict is not None and not unknown and not duplicates
+                     and all(p in by_path for p in candidates)),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Pure helpers: Jira
 # ---------------------------------------------------------------------------
 
@@ -659,6 +843,21 @@ TRANSITION_NAMES = {
 }
 TARGET_STATUS_NAMES = {"done": ("done", "closed"), "resolved": ("resolved",)}
 NAME_REF_TYPES = frozenset(["priority", "version", "component", "resolution", "securitylevel"])
+
+
+_PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def choose_create_project(override, configured):
+    """Project for a NEW ticket: a one-off --project (e.g. the artist board) wins over MPS_JIRA_PROJECT_KEY.
+
+    Existing tickets are never checked against either: any project on the Jira instance is accepted.
+    """
+    key = (override or configured or "").strip().upper()
+    if not _PROJECT_KEY_RE.match(key):
+        raise MpsError("invalid_project_key", "Mã project Jira không hợp lệ: '%s' (ví dụ đúng: MPS, ART)."
+                       % (override or configured))
+    return key
 
 
 def normalize_issue_type(name):
@@ -1256,6 +1455,160 @@ def ensure_branch_matches_base(root, base, branch_ref, branch_name, key):
                        foreign_commit_count=len(foreign))
 
 
+def _base_config_key(branch):
+    return "branch.%s.%s" % (branch, BASE_CONFIG_NAME)
+
+
+def recorded_base(root, branch):
+    """Base branch recorded by prepare-branch for this ticket branch (repo-local git config), or None."""
+    if not branch:
+        return None
+    result = run_git(["config", "--local", "--get", _base_config_key(branch)], root, check=False)
+    return result.stdout.strip() or None
+
+
+def record_base(root, branch, base):
+    run_git(["config", "--local", _base_config_key(branch), base], root)
+
+
+def ensure_recorded_base_matches(root, branch, base):
+    recorded = recorded_base(root, branch)
+    if recorded and recorded != base:
+        raise MpsError("base_mismatch",
+                       "Nhánh %s được tạo từ %s nên phải gộp (merge) về đúng %s, không phải %s. Nếu thật sự cần đưa thay "
+                       "đổi này sang %s, hãy nhờ developer." % (branch, recorded, recorded, base, base),
+                       branch=branch, recorded_base=recorded, requested_base=base)
+    return recorded
+
+
+def ensure_valid_base(name, branches):
+    """Ticket branches are only ever based on / merged into develop, master or a release/* branch."""
+    if not is_protected_branch(name, branches):
+        raise MpsError("invalid_base", "Nhánh gốc/đích '%s' không hợp lệ: chỉ dùng %s, %s hoặc %s*." % (
+            name, branches["dev"], branches["prod"], branches["beta_prefix"]),
+            base=name, allowed=[branches["dev"], branches["prod"], branches["beta_prefix"] + "*"])
+
+
+def closest_bases(counts):
+    """{base: commits in origin/base..source} -> the base(s) the source branch was most likely made from."""
+    if not counts:
+        return []
+    fewest = min(counts.values())
+    return sorted(name for name, count in counts.items() if count == fewest)
+
+
+def origin_base_candidates(root, branches):
+    names = [branches["dev"], branches["prod"]]
+    output = run_git(["for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin/" + branches["beta_prefix"]],
+                     root).stdout
+    names.extend(line.strip() for line in output.splitlines() if line.strip())
+    return [n for n in names if ref_exists(root, "refs/remotes/origin/" + n)]
+
+
+def ensure_mr_target(root, source, target, key, branches):
+    """Offline guard before creating/reusing an MR.
+
+    The target must be the recorded base of the source branch; without a record, the protected branch the source
+    is closest to (fewest commits in origin/X..source). Every non-merge commit in the range must mention the key.
+    The pushed branch (origin/<source>) is what the MR contains, so it is preferred over the local branch.
+    """
+    ensure_valid_base(target, branches)
+    recorded = recorded_base(root, source)
+    if recorded and recorded != target:
+        raise MpsError("target_mismatch_recorded_base",
+                       "Nhánh %s được tạo từ %s nên merge request phải vào %s, không phải %s." % (
+                           source, recorded, recorded, target),
+                       source=source, recorded_base=recorded, target=target)
+    if not ref_exists(root, "refs/remotes/origin/" + target):
+        raise MpsError("base_not_found", "Chưa có origin/%s trên máy (nhánh đích không tồn tại hoặc chưa tải về)."
+                       % target, base=target)
+    if ref_exists(root, "refs/remotes/origin/" + source):
+        source_ref = "refs/remotes/origin/" + source
+    elif ref_exists(root, "refs/heads/" + source):
+        source_ref = "refs/heads/" + source
+    else:
+        raise MpsError("branch_not_found", "Không có nhánh %s trên máy lẫn trên GitLab (đã push chưa?)." % source,
+                       branch=source)
+    if not recorded:
+        counts = {}
+        for name in origin_base_candidates(root, branches):
+            log_range = "refs/remotes/origin/%s..%s" % (name, source_ref)
+            counts[name] = int(run_git(["rev-list", "--count", log_range], root).stdout.strip() or 0)
+        inferred = closest_bases(counts)
+        if target not in inferred:
+            raise MpsError("target_mismatch_inferred_base",
+                           "Nhánh %s có vẻ được tạo từ %s, không phải %s. Merge request phải vào đúng nhánh gốc — hãy "
+                           "nhờ developer kiểm tra." % (source, " / ".join(inferred), target),
+                           source=source, target=target, inferred_bases=inferred, commit_counts=counts)
+    ensure_branch_matches_base(root, target, source_ref, source, key)
+    return recorded
+
+
+def head_sha(root):
+    result = run_git(["rev-parse", "-q", "--verify", "HEAD"], root, check=False)
+    return result.stdout.strip() if result.ok else None
+
+
+def file_blobs(root, paths):
+    """{path: git blob hash of the working-tree file, or "deleted"} - one batched hash-object call."""
+    existing = [p for p in paths if os.path.isfile(os.path.join(root, p))]
+    blobs = dict((p, "deleted") for p in paths)
+    if existing:
+        stdin = ("\n".join(existing) + "\n").encode("utf-8")
+        hashes = run_git(["hash-object", "--stdin-paths"], root, input_bytes=stdin).stdout.split()
+        blobs.update(zip(existing, hashes))
+    return blobs
+
+
+def scope_path(root):
+    return os.path.join(mps_tmp_dir(root), SCOPE_FILENAME)
+
+
+def load_scope(root, branch):
+    """The decisions of the last `review classify`, valid only for the same branch and HEAD."""
+    path = scope_path(root)
+    if not os.path.isfile(path):
+        raise MpsError("scope_review_required", "Chưa có kết quả review phạm vi cho các thay đổi hiện tại. Hãy chạy "
+                                                "review phạm vi (bước 6) trước khi commit.")
+    with open(path, "rb") as handle:
+        scope = json.loads(handle.read().decode("utf-8"))
+    if scope.get("branch") != branch or scope.get("head") != head_sha(root):
+        raise MpsError("scope_review_required", "Kết quả review phạm vi đã cũ (nhánh hoặc commit đã thay đổi từ lúc "
+                                                "review). Hãy review lại.",
+                       reviewed_branch=scope.get("branch"), current_branch=branch)
+    return scope
+
+
+def check_against_scope(scope, requested, current_blobs, include_out_of_scope):
+    """Every requested file must be approved by the review (or explicitly named by the user) and unchanged since."""
+    allowed = set(scope.get("commit_files") or []) | set(include_out_of_scope)
+    not_in_scope = [p for p in requested if p not in allowed]
+    if not_in_scope:
+        raise MpsError("not_in_scope", "Các file sau không nằm trong danh sách được review cho phép commit: %s. Chỉ "
+                                       "thêm khi người dùng chỉ đích danh từng file (--include-out-of-scope)."
+                       % ", ".join(not_in_scope), files=not_in_scope)
+    reviewed = scope.get("blobs") or {}
+    changed = [p for p in requested if reviewed.get(p) != current_blobs.get(p)]
+    if changed:
+        raise MpsError("changed_since_review", "Các file sau đã thay đổi (hoặc chưa được review) sau lần review phạm vi: "
+                                               "%s. Hãy chạy lại review." % ", ".join(changed), files=changed)
+
+
+def review_candidates(root, base_ref):
+    """Files the reviewer must classify: uncommitted changes (the commit decision) and commits already on the branch.
+
+    .env files are never candidates (they can never be committed); rename sources follow their new path.
+    """
+    status = git_status(root)
+    sources = set(status["renames"].values())
+    uncommitted = [p for p in _changed_paths(status) if not is_env_file(p) and p not in sources]
+    committed = []
+    if head_exists(root) and ref_exists(root, "refs/remotes/" + base_ref):
+        committed = [p for p in _name_only_z(root, [base_ref + "...HEAD"])
+                     if not is_env_file(p) and p not in uncommitted]
+    return uncommitted, committed
+
+
 def mps_tmp_dir(root):
     """Scratch folder for temp files (descriptions, comments) inside the git dir: never committed."""
     path = os.path.join(git_dir(root), TMP_DIRNAME)
@@ -1573,10 +1926,24 @@ def cmd_jira_get(args):
     return issue
 
 
+def cmd_jira_projects(args):
+    cfg = load_config(find_project_root())
+    return {"default_project": cfg.get(KEY_JIRA_PROJECT) or None, "projects": list_jira_projects(jira_client(cfg))}
+
+
+def ensure_jira_project_exists(jira, project_key):
+    resp = jira.request("GET", "/rest/api/2/project/" + urllib.parse.quote(project_key), allow_statuses=(404,))
+    if resp.status == 404:
+        raise MpsError("jira_project_not_found", "Không tìm thấy project Jira '%s' (hoặc bạn không có quyền xem). Hãy "
+                                                 "chọn một project trong danh sách." % project_key,
+                       project_key=project_key, available_projects=list_jira_projects(jira))
+    return {"key": resp.data.get("key"), "name": resp.data.get("name")}
+
+
 def cmd_jira_create(args):
     cfg = load_config(find_project_root())
     cfg.require(KEY_JIRA_PROJECT)
-    project_key = cfg.get(KEY_JIRA_PROJECT)
+    project_key = choose_create_project(args.project, cfg.get(KEY_JIRA_PROJECT))
     summary = " ".join((args.summary or "").split())
     if not summary:
         raise MpsError("empty_summary", "Tiêu đề (summary) ticket đang trống.")
@@ -1584,6 +1951,8 @@ def cmd_jira_create(args):
         raise MpsError("summary_too_long", "Tiêu đề ticket dài quá %d ký tự." % JIRA_SUMMARY_MAX_LEN)
     description = read_text_arg(args.description, args.description_file, "mô tả")
     jira = jira_client(cfg)
+    if project_key != cfg.get(KEY_JIRA_PROJECT).upper():
+        ensure_jira_project_exists(jira, project_key)
     me = jira.get("/rest/api/2/myself") or {}
     type_name = "Story" if args.type == "story" else "Bug"
     issue_type, fields_meta, meta_source = load_create_meta(jira, project_key, type_name)
@@ -1620,7 +1989,8 @@ def cmd_jira_create(args):
         else:
             notes.append("Ticket đã tạo nhưng chưa giao (assign) được cho bạn; hãy tự giao trên Jira.")
     return {"key": key, "url": cfg.get(KEY_JIRA_URL).rstrip("/") + "/browse/" + key, "issue_type": args.type,
-            "summary": summary, "assignee": me.get("name"), "createmeta_source": meta_source, "notes": notes}
+            "project": project_key, "summary": summary, "assignee": me.get("name"), "createmeta_source": meta_source,
+            "notes": notes}
 
 
 def cmd_jira_transition(args):
@@ -1675,32 +2045,84 @@ def cmd_naming_build(args):
     return build_names(args.key, args.type, args.title)
 
 
+def branch_context(root, branches, key=None):
+    branch = current_branch(root)
+    recorded = recorded_base(root, branch)
+    detached_at = None
+    if branch is None and head_exists(root):
+        output = run_git(["for-each-ref", "--points-at", "HEAD", "--format=%(refname:strip=3)", "refs/remotes/origin/"],
+                         root).stdout
+        detached_at = unique_protected_branch([line.strip() for line in output.splitlines()], branches)
+    return detect_branch_context(branch, branches, recorded, key=key,
+                                 recorded_base_exists=not recorded or ref_exists(root, "refs/remotes/origin/" + recorded),
+                                 detached_at=detached_at)
+
+
+def has_work_in_progress(root):
+    """Uncommitted changes (except .env files) or commits not on any origin branch."""
+    changed = [p for p in _changed_paths(git_status(root)) if not is_env_file(p)]
+    return bool(changed) or unpushed_commit_count(root) > 0
+
+
 def cmd_flow_plan(args):
-    cfg = load_config(find_project_root())
+    root = find_project_root()
+    cfg = load_config(root)
     branches = cfg.branches()
-    plan = plan_phase(args.phase, args.type, branches)
-    if args.phase == "production":
+    key = normalize_issue_key(args.key)
+    # Pruned fetch first, so a release branch deleted on GitLab no longer counts as an existing base.
+    fetched, _ = run_git_network(root, ["fetch", "--prune", "--no-recurse-submodules", "origin"], cfg)
+    if not fetched.ok:
+        raise_git_network_error(fetched, "fetch")
+    context = branch_context(root, branches, key)
+    dirty = has_work_in_progress(root)
+    phase, phase_source, pinned = reconcile_phase(context, args.phase, dirty)
+    plan = plan_phase(phase, args.type, branches)
+    warnings = []
+    if context["recorded_base_gone"]:
+        warnings.append({"code": "recorded_base_gone", "recorded_base": context["recorded_base"],
+                         "message": "Nhánh %s được tạo từ %s nhưng %s không còn trên GitLab; nhánh này sẽ không được "
+                                    "dùng tiếp." % (context["current_branch"], context["recorded_base"],
+                                                    context["recorded_base"])})
+    if context["branch_ticket_key"] and context["branch_ticket_key"] != key:
+        warnings.append({"code": "other_ticket_branch", "branch_ticket_key": context["branch_ticket_key"],
+                         "message": "Bạn đang đứng trên nhánh của ticket khác (%s); công việc cho %s sẽ ở nhánh riêng."
+                                    % (context["branch_ticket_key"], key)})
+    if phase == "production":
         gitlab = gitlab_client(cfg)
         user = gitlab.get("/user") or {}
         project = resolve_gitlab_project(cfg, gitlab)
-        plan = plan_phase(args.phase, args.type, branches,
+        plan = plan_phase(phase, args.type, branches,
                           access_level=gitlab_access_level(gitlab, project["id"], user.get("id")))
-    elif plan["needs_release_lookup"]:
+    elif phase == "beta":
         gitlab = gitlab_client(cfg)
         project = resolve_gitlab_project(cfg, gitlab)
         prefix = branches["beta_prefix"]
         raw = gitlab_get_all(gitlab, "/projects/%s/repository/branches" % project["id"], {"search": "^" + prefix})
         candidates = [{"name": b.get("name"), "committed_date": (b.get("commit") or {}).get("committed_date")}
                       for b in raw]
-        ordered = sort_release_branches(candidates, prefix)
-        if not ordered:
+        names = [b["name"] for b in sort_release_branches(candidates, prefix)]
+        if pinned:
+            # Work started on a specific release branch: it goes back into THAT branch, even if not the newest.
+            release = context["detected_base"]
+            warning = check_release_branch(release, names)
+            if warning:
+                warnings.append(warning)
+        elif names:
+            release = names[0]
+        else:
             raise MpsError("no_release_branch", "Không tìm thấy nhánh beta nào (%s*) trên GitLab. Có thể giai đoạn beta "
                                                 "chưa bắt đầu — hãy hỏi developer." % prefix)
-        plan["base_branch"] = ordered[0]["name"]
-        plan["target_branch"] = ordered[0]["name"]
+        plan["base_branch"] = release
+        plan["target_branch"] = release
         plan["release_sort"] = release_sort_method(candidates, prefix)
-        plan["release_branches"] = [b["name"] for b in ordered[:RELEASE_BRANCHES_REPORTED]]
+        plan["release_branches"] = names[:RELEASE_BRANCHES_REPORTED]
+    if pinned and phase != "beta":
+        plan["base_branch"] = context["detected_base"]
+        plan["target_branch"] = context["detected_base"]
     plan.pop("needs_release_lookup", None)
+    plan.update(context)
+    plan.update({"phase_source": phase_source, "pinned_by_current_branch": pinned, "work_in_progress": dirty,
+                 "warnings": warnings})
     return plan
 
 
@@ -1831,7 +2253,10 @@ def cmd_git_preflight(args):
     if args.base and not ref_exists(root, "refs/remotes/origin/" + args.base):
         warnings.append({"code": "base_not_fetched", "message": "Chưa có origin/%s trên máy; bước prepare-branch sẽ tải "
                                                                 "về." % args.base})
-    return {"branch": branch, "upstream": upstream, "ahead": ahead, "behind": behind, "staged": status["staged"],
+    context = detect_branch_context(branch, branches, recorded_base(root, branch))
+    return {"branch": branch, "current_branch_role": context["current_branch_role"],
+            "recorded_base": context["recorded_base"], "detected_phase": context["detected_phase"],
+            "upstream": upstream, "ahead": ahead, "behind": behind, "staged": status["staged"],
             "unstaged": status["unstaged"], "untracked": status["untracked"], "unmerged": status["unmerged"],
             "has_changes": bool(changed), "can_proceed": not blockers, "blockers": blockers, "warnings": warnings}
 
@@ -1895,21 +2320,25 @@ def cmd_git_prepare_branch(args):
     key = normalize_issue_key(args.key)
     validate_branch_name(root, args.branch)
     validate_branch_name(root, args.base)
+    ensure_valid_base(args.base, cfg.branches())
     ensure_no_operation_in_progress(root)
     ensure_no_unmerged(root)
-    fetched, used_token = run_git_network(root, ["fetch", "--no-recurse-submodules", "origin"], cfg)
+    # --prune only removes remote-tracking refs of branches deleted on GitLab (e.g. a finished release/*).
+    fetched, used_token = run_git_network(root, ["fetch", "--prune", "--no-recurse-submodules", "origin"], cfg)
     if not fetched.ok:
         raise_git_network_error(fetched, "fetch")
     if not ref_exists(root, "refs/remotes/origin/" + args.base):
         raise MpsError("base_not_found", "Không tìm thấy nhánh gốc origin/%s trên GitLab." % args.base, base=args.base)
     result = {"branch": args.branch, "base": args.base, "used_token_fallback": used_token, "stash_used": False}
+    # A ticket branch remembers the branch it was made from and must go back into exactly that branch.
+    recorded = ensure_recorded_base_matches(root, args.branch, args.base)
+    result["base_recorded"] = False
     # Existing branches are verified against the base BEFORE switching: a dev-based bugfix branch must never be
     # reused for a release (beta) MR, or unreleased develop commits would ride along.
     if current_branch(root) == args.branch:
         ensure_branch_matches_base(root, args.base, "HEAD", args.branch, key)
         result["action"] = "already_on_branch"
-        return result
-    if ref_exists(root, "refs/heads/" + args.branch):
+    elif ref_exists(root, "refs/heads/" + args.branch):
         ensure_branch_matches_base(root, args.base, "refs/heads/" + args.branch, args.branch, key)
         result["stash_used"] = _switch_carrying_changes(root, ["switch", args.branch])
         result["action"] = "switched_existing"
@@ -1919,21 +2348,34 @@ def cmd_git_prepare_branch(args):
             root, ["switch", "-c", args.branch, "--track", "origin/" + args.branch])
         result["action"] = "created_tracking"
     else:
-        left_behind = unpushed_commit_count(root)
-        if left_behind and not args.leave_commits:
-            raise MpsError("local_commits_not_carried",
-                           "Nhánh hiện tại có %d commit chưa đẩy lên GitLab. Nhánh mới sẽ được tạo từ origin/%s nên "
-                           "KHÔNG mang theo các commit này (chúng vẫn nằm nguyên ở nhánh cũ). Hãy hỏi developer; chỉ "
-                           "chạy lại với --leave-commits khi người dùng xác nhận bỏ chúng lại." % (left_behind, args.base),
-                           count=left_behind, current_branch=current_branch(root))
-        result["commits_left_behind"] = left_behind
-        switch_args = ["switch", "--no-track", "-c", args.branch, "origin/" + args.base]
-        if _changed_paths(git_status(root)):
-            result["stash_used"] = _switch_with_stash(root, switch_args)
-        else:
-            run_git(switch_args, root)
-        result["action"] = "created_from_base"
+        recorded = None
+        result.update(_create_from_base(root, args))
+    if not recorded:
+        record_base(root, args.branch, args.base)
+        result["base_recorded"] = True
     return result
+
+
+def _create_from_base(root, args):
+    left_behind = unpushed_commit_count(root)
+    if left_behind and not args.leave_commits:
+        raise MpsError("local_commits_not_carried",
+                       "Nhánh hiện tại có %d commit chưa đẩy lên GitLab. Nhánh mới sẽ được tạo từ origin/%s nên "
+                       "KHÔNG mang theo các commit này (chúng vẫn nằm nguyên ở nhánh cũ). Hãy hỏi developer; chỉ "
+                       "chạy lại với --leave-commits khi người dùng xác nhận bỏ chúng lại." % (left_behind, args.base),
+                       count=left_behind, current_branch=current_branch(root))
+    switch_args = ["switch", "--no-track", "-c", args.branch, "origin/" + args.base]
+    stash_used = False
+    if _changed_paths(git_status(root)):
+        try:
+            stash_used = _switch_with_stash(root, switch_args)
+        except MpsError as exc:
+            if exc.code == "stash_conflict" and current_branch(root) == args.branch:
+                record_base(root, args.branch, args.base)  # the branch exists; remember where it came from
+            raise
+    else:
+        run_git(switch_args, root)
+    return {"action": "created_from_base", "stash_used": stash_used, "commits_left_behind": left_behind}
 
 
 _REVIEW_EXCLUDES = ["--", ".", ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*"]
@@ -1967,8 +2409,11 @@ def cmd_git_diff_for_review(args):
     untracked = [{"path": path, "content": budgeted[2 + i][0], "truncated": budgeted[2 + i][1]}
                  for i, path in enumerate(untracked_paths)]
     hidden = _hidden_env_paths(root, base_ref, untracked_paths)
+    to_classify, already_committed = review_candidates(root, base_ref)
     result = {
         "base": args.base,
+        "files_to_classify": to_classify,
+        "already_committed_files": already_committed,
         "committed_files": _name_status(root, [base_ref + "...HEAD"]) if head_exists(root) else [],
         "working_files": _name_status(root, ["HEAD"]) if head_exists(root) else [],
         "untracked_files_list": untracked_paths,
@@ -1978,9 +2423,10 @@ def cmd_git_diff_for_review(args):
     }
     if args.to_file:
         path = os.path.join(git_dir(root), REVIEW_BUNDLE_FILENAME)
+        bundle = _render_review_bundle(args.base, budgeted[0][0], budgeted[1][0], untracked, hidden, truncated,
+                                       to_classify + already_committed)
         with open(path, "wb") as handle:
-            handle.write(_render_review_bundle(args.base, budgeted[0][0], budgeted[1][0], untracked, hidden, truncated)
-                         .encode("utf-8"))
+            handle.write(bundle.encode("utf-8"))
         result["bundle_path"] = path
     else:
         result["committed_diff"] = budgeted[0][0]
@@ -2021,14 +2467,18 @@ def _hidden_env_paths(root, base_ref, untracked_paths):
     return sorted(set(p for p in paths if is_env_file(p)))
 
 
-def _render_review_bundle(base, committed, working, untracked, hidden, truncated):
+def _render_review_bundle(base, committed, working, untracked, hidden, truncated, files_to_classify):
     parts = ["# Change bundle for scope review", "",
              "Base: origin/%s. Truncated: %s." % (base, "YES (review what is shown, say so in the verdict)"
                                                    if truncated else "no"), "",
-             "## 1. Commits on this branch not yet in origin/%s" % base, "", "```diff", committed or "(none)", "```", "",
-             "## 2. Uncommitted changes (staged + unstaged)", "", "```diff", working or "(none)", "```", "",
-             "## 3. New untracked files", ""]
-    shown = [item for item in untracked if not is_env_file(item["path"])]
+             "## 0. Files to classify (each must appear exactly once in your FILES: block)", ""]
+    parts.extend(["- " + path for path in files_to_classify] or ["(none)"])
+    parts.extend(["",
+                  "## 1. Commits on this branch not yet in origin/%s" % base, "", "```diff", committed or "(none)",
+                  "```", "",
+                  "## 2. Uncommitted changes (staged + unstaged)", "", "```diff", working or "(none)", "```", "",
+                  "## 3. New untracked files", ""])
+    shown =[item for item in untracked if not is_env_file(item["path"])]
     if not shown:
         parts.append("(none)")
     for item in shown:
@@ -2062,22 +2512,43 @@ def cmd_git_commit(args):
     message = args.message
     if not message.strip():
         raise MpsError("empty_message", "Nội dung commit đang trống.")
-    requested = ["."] if args.all else [normalize_target_path(f) for f in args.files]
+    requested = [normalize_target_path(f) for f in args.files]
+    included = [normalize_target_path(f) for f in args.include_out_of_scope or []]
+    stray = [p for p in included if p not in requested]
+    if stray:
+        raise MpsError("invalid_include", "--include-out-of-scope chỉ dùng cho file cũng có trong --files: %s."
+                       % ", ".join(stray), files=stray)
     named_env = [p for p in requested if is_env_file(p)]
     if named_env:
         raise MpsError("env_file", "Không được commit file .env (chứa token/bí mật).", files=named_env)
+    changed = _changed_paths(status)
+    if not changed:
+        raise MpsError("nothing_to_commit", "Không có thay đổi nào để commit.")
+    # Only exact changed paths are accepted: a folder (even a deleted one), '.' or a typo would sweep in or miss
+    # changes (Unity-regenerated .meta/ProjectSettings, lock files, someone else's edits).
+    sources = set(status["renames"].values())
+    exact = set(changed) | set(status["renames"]) | sources
+    inexact = [p for p in requested if p not in exact]
+    if inexact:
+        raise MpsError("explicit_files_required", "Chỉ commit đúng từng file đang thay đổi (như danh sách của git "
+                                                  "preflight), không dùng thư mục hay đường dẫn khác: %s."
+                       % ", ".join(inexact),
+                       files=inexact, changed_files_inside=[p for p in changed if path_in_targets(p, inexact)])
     # Rename sources no longer exist in the work tree or index, so `git add` would reject them; their deletion is
     # already staged and only needs to survive the scope filter below.
     targets = expand_rename_sources(requested, status["renames"])
-    to_add = [p for p in requested if p not in status["renames"].values()]
+    # The commit may only contain what the scope review approved (or what the user named explicitly), unchanged.
+    reviewed = [p for p in targets if p not in sources]
+    check_against_scope(load_scope(root, branch), reviewed, file_blobs(root, reviewed), included)
+    to_add = [p for p in requested if p not in sources]
     staged_before = set(staged_paths(root))
     if to_add:
         added = run_git(["add", "-A", "--"] + to_add, root, check=False, literal_pathspecs=True)
         if not added.ok:
             raise MpsError("add_failed", "Không đưa được file vào commit (đường dẫn sai hoặc file bị git bỏ qua). "
                                          "Đường dẫn phải tính từ thư mục gốc project.", stderr=added.stderr.strip())
-    # Inspect what is REALLY staged: folder arguments ('cfg', '.') can pull in .env files, and files the user had
-    # staged earlier may lie outside the agreed list. Only the index is changed here, never the working tree.
+    # Inspect what is REALLY staged: files the user (or an IDE) staged earlier may lie outside the agreed list or
+    # be .env files. Only the index is changed here, never the working tree.
     staged = staged_paths(root)
     newly_staged = [p for p in staged if p not in staged_before]
     staged_env = [p for p in staged if is_env_file(p)]
@@ -2101,10 +2572,36 @@ def cmd_git_commit(args):
         if "nothing to commit" in text or "no changes added" in text:
             raise MpsError("nothing_to_commit", "Không có thay đổi nào để commit.")
         raise MpsError("commit_failed", "Commit thất bại.", stderr=commit.stderr.strip() or commit.stdout.strip())
+    os.remove(scope_path(root))  # one review approves one commit
     sha = run_git(["rev-parse", "HEAD"], root).stdout.strip()
     files = [line for line in run_git(["show", "--name-status", "--format=", "HEAD"], root).stdout.splitlines()
              if line.strip()]
-    return {"branch": branch, "commit": sha, "message": message, "files": files, "unstaged_other_files": outside}
+    return {"branch": branch, "commit": sha, "message": message, "files": files, "unstaged_other_files": outside,
+            "left_uncommitted": _changed_paths(git_status(root))}
+
+
+def cmd_review_classify(args):
+    """Check the reviewer's FILES: block against the real changes and derive the default commit / exclude lists."""
+    root = find_project_root()
+    if os.path.isfile(scope_path(root)):
+        os.remove(scope_path(root))  # a new review always replaces the previous decisions
+    uncommitted, committed = review_candidates(root, "origin/" + args.base)
+    entries, verdict = parse_review_files(read_text_arg(None, args.result_file, "kết quả review"))
+    if not entries:
+        raise MpsError("review_unparsable", "Không đọc được khối FILES: trong kết quả review. Hãy yêu cầu reviewer trả "
+                                            "lời đúng định dạng rồi chạy lại.", result_file=args.result_file)
+    result = classify_review(entries, uncommitted, committed, verdict)
+    result.update({"files_to_classify": uncommitted, "already_committed_files": committed})
+    # Persist the decisions: `git commit` only accepts files approved here, unchanged since this moment.
+    scope = {"base": args.base, "branch": current_branch(root), "head": head_sha(root),
+             "blobs": file_blobs(root, uncommitted)}
+    for name in ("commit_files", "excluded_files", "mixed_files", "unclassified_files", "needs_decision", "verdict"):
+        scope[name] = result[name]
+    path = scope_path(root)
+    with open(path, "wb") as handle:
+        handle.write(json.dumps(scope, ensure_ascii=False, indent=2).encode("utf-8"))
+    result["scope_file"] = path
+    return result
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+$")
@@ -2134,9 +2631,11 @@ def cmd_git_push(args):
     if not ref_exists(root, "refs/heads/" + name):
         raise MpsError("branch_not_found", "Không có nhánh %s trên máy." % name)
     validate_branch_name(root, args.base)
+    ensure_valid_base(args.base, cfg.branches())
     if not ref_exists(root, "refs/remotes/origin/" + args.base):
         raise MpsError("base_not_found", "Chưa có origin/%s trên máy. Hãy chạy git prepare-branch trước." % args.base,
                        base=args.base)
+    ensure_recorded_base_matches(root, name, args.base)
     # Last gate before anything leaves the machine. Inspected per commit (git log), not as a net diff: a secret
     # added in one commit and deleted in a later one is gone from the diff but still published in history.
     publish_range = "origin/%s..refs/heads/%s" % (args.base, name)
@@ -2170,9 +2669,12 @@ def _find_open_mr(gitlab, project_id, source):
 
 
 def cmd_mr_ensure(args):
-    cfg = load_config(find_project_root())
+    root = find_project_root()
+    cfg = load_config(root)
     if args.source == args.target:
         raise MpsError("invalid_mr", "Nhánh nguồn và nhánh đích không được trùng nhau.")
+    # Offline guard first: the MR must go back into the branch the work was based on, with only this ticket's commits.
+    ensure_mr_target(root, args.source, args.target, normalize_issue_key(args.key), cfg.branches())
     gitlab = gitlab_client(cfg)
     project = resolve_gitlab_project(cfg, gitlab)
     existing = _find_open_mr(gitlab, project["id"], args.source)
@@ -2244,7 +2746,10 @@ def build_parser():
     desc.add_argument("--description-file", help="UTF-8 file with the description")
     p.add_argument("--field", action="append", default=[], metavar="NAME=VALUE",
                    help="extra field by id or name (repeatable); JSON values allowed")
+    p.add_argument("--project", help="one-off Jira project key (e.g. the artist board); default MPS_JIRA_PROJECT_KEY")
     p.set_defaults(handler=cmd_jira_create)
+    p = jira.add_parser("projects", help="list Jira projects (boards) you can see")
+    p.set_defaults(handler=cmd_jira_projects)
     p = jira.add_parser("transition", help="move a ticket to done/resolved")
     p.add_argument("key")
     p.add_argument("--to", required=True, choices=("done", "resolved"))
@@ -2264,8 +2769,9 @@ def build_parser():
     p.set_defaults(handler=cmd_naming_build)
 
     flow = _subcommands(groups.add_parser("flow", help="phase rules"), "command")
-    p = flow.add_parser("plan", help="base/target branch and kind for a phase")
-    p.add_argument("--phase", required=True, choices=PHASES)
+    p = flow.add_parser("plan", help="base/target branch and kind; phase detected from the current branch if omitted")
+    p.add_argument("--phase", choices=PHASES, help="omit to detect it from the current branch")
+    p.add_argument("--key", required=True, help="current Jira ticket; only its own ticket branch pins the phase")
     p.add_argument("--type", required=True, choices=TICKET_TYPES)
     p.set_defaults(handler=cmd_flow_plan)
 
@@ -2289,11 +2795,11 @@ def build_parser():
     p.add_argument("--base", required=True)
     p.add_argument("--to-file", action="store_true", help="write the bundle to <git-dir>/%s" % REVIEW_BUNDLE_FILENAME)
     p.set_defaults(handler=cmd_git_diff_for_review)
-    p = git.add_parser("commit", help="stage and commit")
+    p = git.add_parser("commit", help="commit exactly the listed files (no folders, no 'everything' mode)")
     p.add_argument("--message", required=True)
-    which = p.add_mutually_exclusive_group(required=True)
-    which.add_argument("--all", action="store_true")
-    which.add_argument("--files", nargs="+")
+    p.add_argument("--files", nargs="+", required=True, help="root-relative file paths agreed with the user")
+    p.add_argument("--include-out-of-scope", nargs="+", metavar="FILE",
+                   help="files (also in --files) the user explicitly chose to commit although the review did not")
     p.set_defaults(handler=cmd_git_commit)
     p = git.add_parser("push", help="push the branch (never forced)")
     p.add_argument("--branch", required=True)
@@ -2306,7 +2812,14 @@ def build_parser():
     p.add_argument("--target", required=True)
     p.add_argument("--title", required=True)
     p.add_argument("--description", required=True)
+    p.add_argument("--key", required=True, help="Jira key; every commit in origin/TARGET..SOURCE must mention it")
     p.set_defaults(handler=cmd_mr_ensure)
+
+    review = _subcommands(groups.add_parser("review", help="scope review result"), "command")
+    p = review.add_parser("classify", help="check the reviewer's FILES: block, derive commit / exclude lists")
+    p.add_argument("--base", required=True)
+    p.add_argument("--result-file", required=True, help="file with the reviewer's full reply (in tmp_dir)")
+    p.set_defaults(handler=cmd_review_classify)
     return parser
 
 

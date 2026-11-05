@@ -386,8 +386,215 @@ class RedactTests(unittest.TestCase):
         self.assertEqual(mps.redact('{"x": "supersecretvalue"}'), '{"x": "****"}')
 
 
+class JiraProjectChoiceTests(unittest.TestCase):
+    """R1: the ticket's project may differ from the GitLab project; --project overrides the configured default."""
+
+    def test_override_wins_and_is_normalized(self):
+        self.assertEqual(mps.choose_create_project("art", "MPS"), "ART")
+        self.assertEqual(mps.choose_create_project(None, "mps"), "MPS")
+        self.assertEqual(mps.choose_create_project("", "MPS"), "MPS")
+
+    def test_invalid_key_rejected(self):
+        with self.assertRaises(mps.MpsError) as ctx:
+            mps.choose_create_project("ART-12", "MPS")
+        self.assertEqual(ctx.exception.code, "invalid_project_key")
+
+    def test_ticket_keys_from_any_board_are_accepted(self):
+        self.assertEqual(mps.normalize_issue_key("art-12"), "ART-12")
+        names = mps.build_names("ART-12", "story", "Vẽ lại icon")
+        self.assertEqual(names["branch"], "feature/ART-12-ve-lai-icon")
+        self.assertEqual(names["mr_description"], "Close ART-12")
+        self.assertTrue(mps.mentions_key("feat: ART-12 Vẽ lại icon", "ART-12"))
+
+
+class ReviewClassifyTests(unittest.TestCase):
+    """R2: the reviewer's FILES block drives the default commit set; out-of-scope is excluded by default."""
+
+    REPLY = "\n".join([
+        "### Kết quả review phạm vi - MPS-1",
+        "| a | b | c | d |",
+        "VERDICT: FAIL",
+        "",
+        "FILES:",
+        "in_scope: src/login.cs",
+        "out_of_scope: ProjectSettings/ProjectSettings.asset",
+        "mixed: src/menu.cs   (rename of unrelated variable)",
+        "- concern: `src/debug.cs`",
+        "in_scope: src/login.cs",
+        "in_scope: not/in/bundle.cs",
+        "VERDICT: FAIL",
+    ])
+
+    def test_parse_review_files(self):
+        entries, verdict = mps.parse_review_files(self.REPLY)
+        self.assertEqual(verdict, "FAIL")
+        self.assertEqual(entries[0], ("in_scope", "src/login.cs"))
+        self.assertEqual(entries[3], ("concern", "src/debug.cs"))
+        self.assertEqual(len(entries), 6)
+
+    def test_classify_review(self):
+        entries, _ = mps.parse_review_files(self.REPLY)
+        uncommitted = ["src/login.cs", "ProjectSettings/ProjectSettings.asset", "src/menu.cs", "src/debug.cs",
+                       "package-lock.json"]
+        result = mps.classify_review(entries, uncommitted, ["src/old.cs"], "PASS")
+        self.assertEqual(result["commit_files"], ["src/login.cs", "src/debug.cs"])
+        self.assertEqual(result["concern_files"], ["src/debug.cs"])
+        self.assertEqual(result["needs_decision"], [])
+        self.assertEqual(result["excluded_files"], ["ProjectSettings/ProjectSettings.asset"])
+        self.assertEqual(result["mixed_files"], ["src/menu.cs"])
+        self.assertEqual(result["unclassified_files"], ["package-lock.json"])
+        self.assertEqual(result["duplicate_paths"], ["src/login.cs"])
+        self.assertEqual(result["unknown_paths"], ["not/in/bundle.cs"])
+        self.assertFalse(result["complete"])
+
+    def test_complete_classification(self):
+        entries, verdict = mps.parse_review_files("FILES:\nin_scope: a.cs\nout_of_scope: b.meta\nVERDICT: PASS\n")
+        result = mps.classify_review(entries, ["a.cs", "b.meta"], [], verdict)
+        self.assertTrue(result["complete"])
+        self.assertEqual(verdict, "PASS")
+        self.assertEqual(result["commit_files"], ["a.cs"])
+
+    def test_fail_verdict_moves_concerns_to_needs_decision(self):
+        entries, verdict = mps.parse_review_files("FILES:\nin_scope: a.cs\nconcern: d.cs\nVERDICT: FAIL\n")
+        result = mps.classify_review(entries, ["a.cs", "d.cs"], [], verdict)
+        self.assertEqual((result["commit_files"], result["needs_decision"]), (["a.cs"], ["d.cs"]))
+        self.assertTrue(result["complete"])
+        no_verdict = mps.classify_review(entries, ["a.cs", "d.cs"], [], None)
+        self.assertEqual(no_verdict["commit_files"], ["a.cs"])
+        self.assertFalse(no_verdict["complete"])
+
+    def test_no_files_block(self):
+        self.assertEqual(mps.parse_review_files("in_scope: a.cs\nVERDICT: PASS"), ([], "PASS"))
+
+
+class BranchContextTests(unittest.TestCase):
+    """R3: the MR goes back into exactly the branch the work was based on."""
+
+    def test_detect_roles(self):
+        ctx = mps.detect_branch_context
+        self.assertEqual(ctx("develop", BRANCHES, None)["detected_phase"], "dev")
+        beta = ctx("release/1.1", BRANCHES, None)
+        self.assertEqual((beta["current_branch_role"], beta["detected_phase"], beta["detected_base"]),
+                         ("beta", "beta", "release/1.1"))
+        self.assertEqual(ctx("master", BRANCHES, None)["detected_phase"], "production")
+        ticket = ctx("bugfix/MPS-2-x", BRANCHES, "release/1.0")
+        self.assertEqual((ticket["current_branch_role"], ticket["detected_phase"], ticket["detected_base"]),
+                         ("ticket", "beta", "release/1.0"))
+        self.assertEqual(ctx("bugfix/MPS-2-x", BRANCHES, None)["current_branch_role"], "other")
+        self.assertEqual(ctx("my-work", BRANCHES, None)["current_branch_role"], "other")
+        self.assertEqual(ctx(None, BRANCHES, None)["current_branch_role"], "detached")
+
+    def assert_error(self, code, func, *args):
+        with self.assertRaises(mps.MpsError) as ctx:
+            func(*args)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_reconcile_phase_dirty_tree_pins(self):
+        on_develop = mps.detect_branch_context("develop", BRANCHES, None)
+        self.assertEqual(mps.reconcile_phase(on_develop, None, True), ("dev", "detected", True))
+        self.assertEqual(mps.reconcile_phase(on_develop, "dev", True), ("dev", "detected", True))
+        self.assert_error("phase_conflict", mps.reconcile_phase, on_develop, "beta", True)
+
+    def test_reconcile_phase_clean_tree_follows_request(self):
+        on_develop = mps.detect_branch_context("develop", BRANCHES, None)
+        self.assertEqual(mps.reconcile_phase(on_develop, "beta", False), ("beta", "requested_clean_tree", False))
+        self.assert_error("phase_required", mps.reconcile_phase, on_develop, None, False)
+        on_master = mps.detect_branch_context("master", BRANCHES, None)
+        self.assert_error("phase_required", mps.reconcile_phase, on_master, None, False)
+        other = mps.detect_branch_context("my-work", BRANCHES, None)
+        self.assertEqual(mps.reconcile_phase(other, "beta", True), ("beta", "requested", False))
+        self.assert_error("phase_required", mps.reconcile_phase, other, None, True)
+
+    def test_own_ticket_branch_pins_even_when_clean(self):
+        own = mps.detect_branch_context("bugfix/MPS-2-x", BRANCHES, "release/1.0", key="MPS-2")
+        self.assertEqual(own["current_branch_role"], "ticket")
+        self.assertEqual(mps.reconcile_phase(own, None, False), ("beta", "detected", True))
+        self.assert_error("phase_conflict", mps.reconcile_phase, own, "dev", False)
+        foreign = mps.detect_branch_context("bugfix/MPS-2-x", BRANCHES, "release/1.0", key="MPS-3")
+        self.assertEqual((foreign["current_branch_role"], foreign["branch_ticket_key"]), ("other", "MPS-2"))
+        self.assertEqual(mps.reconcile_phase(foreign, "dev", True), ("dev", "requested", False))
+
+    def test_recorded_base_gone(self):
+        gone = mps.detect_branch_context("bugfix/MPS-2-x", BRANCHES, "release/0.9", key="MPS-2",
+                                         recorded_base_exists=False)
+        self.assertEqual((gone["current_branch_role"], gone["recorded_base_gone"]), ("other", True))
+        self.assertEqual(mps.reconcile_phase(gone, "beta", False)[0], "beta")
+        self.assert_error("recorded_base_gone", mps.reconcile_phase, gone, "beta", True)
+
+    def test_detached_head(self):
+        self.assertEqual(mps.unique_protected_branch(["HEAD", "develop", "feature/x"], BRANCHES), "develop")
+        self.assertIsNone(mps.unique_protected_branch(["develop", "master"], BRANCHES))
+        on_develop = mps.detect_branch_context(None, BRANCHES, None, detached_at="develop")
+        self.assertEqual((on_develop["current_branch_role"], on_develop["detached"]), ("dev", True))
+        unknown = mps.detect_branch_context(None, BRANCHES, None)
+        self.assertEqual(unknown["current_branch_role"], "detached")
+        self.assert_error("detached_head", mps.reconcile_phase, unknown, "dev", True)
+        self.assertEqual(mps.reconcile_phase(unknown, "dev", False)[0], "dev")
+
+    def test_release_branch_checks(self):
+        branches = [{"name": "release/1.1", "committed_date": "2024-01-01T00:00:00Z"},
+                    {"name": "release/1.2", "committed_date": "2024-02-01T00:00:00Z"}]
+        names = [b["name"] for b in mps.sort_release_branches(branches, "release/")]
+        warning = mps.check_release_branch("release/1.1", names)
+        self.assertEqual((warning["code"], warning["latest"]), ("not_latest_release", "release/1.2"))
+        self.assertIsNone(mps.check_release_branch("release/1.2", names))
+        self.assert_error("release_branch_gone", mps.check_release_branch, "release/1.0", names)
+        self.assert_error("release_branch_gone", mps.check_release_branch, "release/1.1", [])
+
+    def test_closest_bases(self):
+        self.assertEqual(mps.closest_bases({"develop": 1, "release/1.0": 2, "master": 1}), ["develop", "master"])
+        self.assertEqual(mps.closest_bases({}), [])
+        self.assertEqual(mps.ticket_key_of_branch("bugfix/art-12-x"), "ART-12")
+        self.assertIsNone(mps.ticket_key_of_branch("develop"))
+
+
 GIT = shutil.which("git")
 LARGE_FILE_BYTES = mps.MAX_FILE_BYTES + 1024
+
+
+class FakeService(object):
+    """Stands in for ServiceClient: routes (method, path) to canned JSON and records every call."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls = []
+
+    def request(self, method, path, params=None, body=None, allow_statuses=()):
+        self.calls.append((method, path, body))
+        if (method, path) not in self.routes:
+            raise AssertionError("unexpected call %s %s" % (method, path))
+        status, data = self.routes[(method, path)]
+        if status >= 400 and status not in allow_statuses:
+            raise mps.MpsError("http_error", "fake %d" % status, status=status)
+        return mps.HttpResponse(status, data, {})
+
+    def get(self, path, params=None):
+        return self.request("GET", path, params=params).data
+
+
+def fake_gitlab(release_branches):
+    return FakeService({
+        ("GET", "/projects/grp%2Fproj"): (200, {"id": 1, "path_with_namespace": "grp/proj", "web_url": "u"}),
+        ("GET", "/projects/1/repository/branches"): (200, [{"name": n, "commit": {"committed_date": None}}
+                                                           for n in release_branches]),
+    })
+
+
+def fake_jira():
+    story_fields = [{"fieldId": "summary", "name": "Summary", "required": True},
+                    {"fieldId": "assignee", "name": "Assignee", "required": False}]
+    routes = {
+        ("GET", "/rest/api/2/myself"): (200, {"name": "hung"}),
+        ("GET", "/rest/api/2/project"): (200, [{"key": "MPS", "name": "Game"}, {"key": "ART", "name": "Artist"}]),
+        ("GET", "/rest/api/2/project/ART"): (200, {"key": "ART", "name": "Artist"}),
+        ("GET", "/rest/api/2/project/NOPE"): (404, None),
+        ("POST", "/rest/api/2/issue"): (201, {"key": "ART-1"}),
+    }
+    for project in ("ART", "MPS"):
+        base = "/rest/api/2/issue/createmeta/%s/issuetypes" % project
+        routes[("GET", base)] = (200, {"values": [{"id": "10", "name": "Story"}], "isLast": True})
+        routes[("GET", base + "/10")] = (200, {"values": story_fields, "isLast": True})
+    return FakeService(routes)
 
 
 def _rmtree(path):
@@ -475,6 +682,28 @@ class GitFlowTests(unittest.TestCase):
     def prepare(self, branch, key, base="develop", *extra):
         return self.mps("git", "prepare-branch", "--base", base, "--branch", branch, "--key", key, *extra)
 
+    def approve(self, in_scope, base="develop", out_of_scope=(), mixed=(), concern=(), verdict="PASS"):
+        """Simulate the scope reviewer's reply and run `review classify` (writes scope.json)."""
+        lines = ["FILES:"]
+        for category, paths in (("in_scope", in_scope), ("out_of_scope", out_of_scope), ("mixed", mixed),
+                                ("concern", concern)):
+            lines.extend("%s: %s" % (category, path) for path in paths)
+        lines.append("VERDICT: " + verdict)
+        reply = os.path.join(mps.mps_tmp_dir(self.repo), "review.txt")
+        with open(reply, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        return self.mps("review", "classify", "--base=" + base, "--result-file=" + reply)
+
+    def commit(self, message, *files):
+        return self.mps("git", "commit", "--message=" + message, "--files", *files)
+
+    def write_env(self, **values):
+        self.write(".env", "".join("%s=%s\n" % item for item in values.items()))
+        self.write(".gitignore", ".env\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-q", "-m", "chore: ignore env")
+        self.git("push", "-q", "origin", "HEAD")
+
     def head(self):
         return self.git("rev-parse", "HEAD").strip()
 
@@ -488,7 +717,8 @@ class GitFlowTests(unittest.TestCase):
         self.assertIn("mps-auto", self.git("stash", "list"))
         self.assertEqual(self.prepare("feature/MPS-1-x", "MPS-1")["error"], "unmerged_files")
         before = self.head()
-        self.assertEqual(self.mps("git", "commit", "--message=feat: MPS-1 x", "--all")["error"], "unmerged_files")
+        self.assertEqual(self.mps("git", "commit", "--message=feat: MPS-1 x", "--files", "app.txt")["error"],
+                         "unmerged_files")
         self.assertEqual(self.head(), before)
         preflight = self.mps("git", "preflight", "--base", "develop")
         self.assertIn("unmerged_files", [b["code"] for b in preflight["blockers"]])
@@ -499,20 +729,29 @@ class GitFlowTests(unittest.TestCase):
         self.prepare("feature/MPS-1-x", "MPS-1")
         self.write("cfg/app.ini", "a=1\n")
         self.write("cfg/.env.local", "MPS_GITLAB_PAT=glpat-abcdefghijklmnop\n")
-        before = self.head()
-        for files in (["cfg"], ["."]):
-            result = self.mps("git", "commit", "--message=feat: MPS-1 x", "--files", *files)
-            self.assertEqual(result["error"], "env_file")
-            self.assertEqual(result["files"], ["cfg/.env.local"])
-            self.assertEqual(self.head(), before)
-            self.assertEqual(self.git("diff", "--cached", "--name-only").strip(), "")
-            self.assertTrue(os.path.isfile(os.path.join(self.repo, "cfg", ".env.local")))
         self.write("cfg/token.py", "GITLAB = 'glpat-abcdefghijklmnop'\n")
-        result = self.mps("git", "commit", "--message=feat: MPS-1 x", "--files", "cfg/token.py")
+        before = self.head()
+        for files in (["cfg"], ["."], ["./"], ["cfg/typo.ini"]):
+            result = self.commit("feat: MPS-1 x", *files)
+            self.assertEqual(result["error"], "explicit_files_required")
+            self.assertEqual(self.head(), before)
+        self.assertEqual(self.commit("x", "cfg/.env.local")["error"], "env_file")
+        approved = self.approve(["cfg/app.ini", "cfg/token.py"])
+        self.assertEqual(approved["files_to_classify"], ["cfg/app.ini", "cfg/token.py"])  # .env never offered
+        # A .env staged earlier (e.g. by an IDE) is caught too, and nothing is committed.
+        self.git("add", "-f", "cfg/.env.local")
+        result = self.commit("feat: MPS-1 x", "cfg/app.ini")
+        self.assertEqual(result["error"], "env_file")
+        self.assertEqual(result["files"], ["cfg/.env.local"])
+        self.assertEqual(self.head(), before)
+        self.assertEqual(self.git("diff", "--cached", "--name-only").strip(), "")
+        self.assertTrue(os.path.isfile(os.path.join(self.repo, "cfg", ".env.local")))
+        result = self.commit("feat: MPS-1 x", "cfg/token.py")
         self.assertEqual(result["error"], "secret_detected")
         self.assertEqual(self.head(), before)
-        ok = self.mps("git", "commit", "--message=feat: MPS-1 x", "--files", "cfg/app.ini")
+        ok = self.commit("feat: MPS-1 x", "cfg/app.ini")
         self.assertEqual(ok["files"], ["A\tcfg/app.ini"])
+        self.assertEqual(sorted(ok["left_uncommitted"]), ["cfg/.env.local", "cfg/token.py"])
 
     def test_push_checks_every_commit_for_env_files_and_secrets(self):
         self.prepare("feature/MPS-1-x", "MPS-1")
@@ -553,7 +792,12 @@ class GitFlowTests(unittest.TestCase):
     def test_beta_refuses_dev_based_branch(self):
         self.prepare("bugfix/MPS-2-x", "MPS-2")
         self.write("fix.txt", "fix\n")
-        self.mps("git", "commit", "--message=fix: MPS-2 x", "--all")
+        self.approve(["fix.txt"])
+        self.commit("fix: MPS-2 x", "fix.txt")
+        # R3: the recorded base answers first ...
+        self.assertEqual(self.prepare("bugfix/MPS-2-x", "MPS-2", "release/1.0")["error"], "base_mismatch")
+        # ... and without a recorded base (e.g. branch made by hand) the foreign-commit check still catches it.
+        self.git("config", "--unset", "branch.bugfix/MPS-2-x.mps-base")
         result = self.prepare("bugfix/MPS-2-x", "MPS-2", "release/1.0")
         self.assertEqual(result["error"], "branch_base_mismatch")
         self.assertEqual([c["subject"] for c in result["foreign_commits"]], ["feat: MPS-5 unreleased feature"])
@@ -561,7 +805,8 @@ class GitFlowTests(unittest.TestCase):
         self.assertEqual(self.prepare("bugfix/MPS-2-x", "MPS-2", "release/1.0")["error"], "branch_base_mismatch")
         self.assertEqual(self.git("branch", "--show-current").strip(), "develop")
         same = self.prepare("bugfix/MPS-2-x", "MPS-2")
-        self.assertEqual(same["action"], "switched_existing")
+        self.assertEqual((same["action"], same["base_recorded"]), ("switched_existing", True))
+        self.assertEqual(mps.recorded_base(self.repo, "bugfix/MPS-2-x"), "develop")
 
     # -- M1 --------------------------------------------------------------
 
@@ -622,15 +867,229 @@ class GitFlowTests(unittest.TestCase):
     def test_resume_after_push_and_rename_commit(self):
         self.prepare("feature/MPS-4-z", "MPS-4")
         self.git("mv", "app.txt", "renamed.txt")
-        committed = self.mps("git", "commit", "--message=feat: MPS-4 Đổi tên", "--files", "renamed.txt")
+        self.assertEqual(self.approve(["renamed.txt"])["files_to_classify"], ["renamed.txt"])
+        committed = self.commit("feat: MPS-4 Đổi tên", "renamed.txt")
         self.assertEqual(committed["files"], ["R100\tapp.txt\trenamed.txt"])
         self.assertEqual(self.git("log", "-1", "--format=%s").strip(), "feat: MPS-4 Đổi tên")
         self.assertEqual(self.git("status", "--porcelain").strip(), "")
         self.mps("git", "push", "--branch", "feature/MPS-4-z", "--base", "develop")
-        self.assertEqual(self.mps("git", "commit", "--message=feat: MPS-4 again", "--all")["error"],
+        self.assertEqual(self.mps("git", "commit", "--message=feat: MPS-4 again", "--files", "renamed.txt")["error"],
                          "nothing_to_commit")
         self.assertEqual(self.prepare("feature/MPS-4-z", "MPS-4")["action"], "already_on_branch")
         self.assertTrue(self.mps("git", "push", "--branch", "feature/MPS-4-z", "--base", "develop")["ok"])
+
+    # -- R2: explicit file lists, out-of-scope files stay on disk ----------
+
+    def test_all_flag_is_gone(self):
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding="utf-8")
+        with mock.patch.object(sys, "stdout", stream), self.assertRaises(SystemExit) as ctx:
+            mps.main(["git", "commit", "--message=x", "--all"])
+        stream.flush()
+        self.assertEqual(ctx.exception.code, mps.EXIT_USAGE)
+        self.assertEqual(json.loads(buffer.getvalue().decode("utf-8"))["error"], "usage_error")
+
+    def test_out_of_scope_files_are_left_uncommitted(self):
+        self.prepare("feature/MPS-6-login", "MPS-6")
+        self.write("src/login.cs", "class Login {}\n")
+        self.write("ProjectSettings/ProjectSettings.asset", "unity: regenerated\n")
+        self.write("app.txt", "line1\nline2 edited by unity import\n")
+        review = self.mps("git", "diff-for-review", "--base=develop", "--to-file")
+        self.assertEqual(sorted(review["files_to_classify"]),
+                         ["ProjectSettings/ProjectSettings.asset", "app.txt", "src/login.cs"])
+        with open(review["bundle_path"], encoding="utf-8") as handle:
+            self.assertIn("## 0. Files to classify", handle.read())
+        reply = os.path.join(mps.mps_tmp_dir(self.repo), "review.txt")
+        with open(reply, "w", encoding="utf-8") as handle:
+            handle.write("FILES:\nin_scope: src/login.cs\nout_of_scope: ProjectSettings/ProjectSettings.asset\n"
+                         "out_of_scope: app.txt\nVERDICT: FAIL\n")
+        classified = self.mps("review", "classify", "--base=develop", "--result-file=" + reply)
+        self.assertTrue(classified["complete"])
+        self.assertEqual(classified["commit_files"], ["src/login.cs"])
+        # M1: an excluded file cannot slip into the commit just by being listed.
+        sneaky = self.commit("feat: MPS-6 Login", "src/login.cs", "ProjectSettings/ProjectSettings.asset")
+        self.assertEqual((sneaky["error"], sneaky["files"]), ("not_in_scope", ["ProjectSettings/ProjectSettings.asset"]))
+        committed = self.commit("feat: MPS-6 Login", *classified["commit_files"])
+        self.assertEqual(committed["files"], ["A\tsrc/login.cs"])
+        self.assertEqual(sorted(committed["left_uncommitted"]), ["ProjectSettings/ProjectSettings.asset", "app.txt"])
+        self.assertIn("unity import", self.read("app.txt"))
+        self.assertNotIn("mps-tmp", self.git("status", "--porcelain", "-uall"))
+        self.assertFalse(os.path.exists(mps.scope_path(self.repo)))  # one review approves one commit
+
+    # -- R3: recorded base, base_mismatch, MR guard, phase detection --------
+
+    def test_recorded_base_and_mismatch(self):
+        created = self.prepare("bugfix/MPS-7-x", "MPS-7", "release/1.0")
+        self.assertEqual((created["action"], created["base_recorded"]), ("created_from_base", True))
+        self.assertEqual(self.git("config", "--local", "--get", "branch.bugfix/MPS-7-x.mps-base").strip(),
+                         "release/1.0")
+        mismatch = self.prepare("bugfix/MPS-7-x", "MPS-7", "develop")
+        self.assertEqual((mismatch["error"], mismatch["recorded_base"]), ("base_mismatch", "release/1.0"))
+        self.write("fix.txt", "fix\n")
+        self.approve(["fix.txt"], base="release/1.0")
+        self.commit("fix: MPS-7 x", "fix.txt")
+        self.assertEqual(self.mps("git", "push", "--branch=bugfix/MPS-7-x", "--base=develop")["error"], "base_mismatch")
+        self.assertEqual(self.mps("git", "push", "--branch=bugfix/MPS-7-x", "--base=feature/x")["error"],
+                         "invalid_base")
+        self.assertEqual(self.prepare("bugfix/MPS-7-x", "MPS-7", "my-work")["error"], "invalid_base")
+        preflight = self.mps("git", "preflight")
+        self.assertEqual((preflight["current_branch_role"], preflight["recorded_base"], preflight["detected_phase"]),
+                         ("ticket", "release/1.0", "beta"))
+
+    def guard_error(self, *args):
+        with self.assertRaises(mps.MpsError) as ctx:
+            mps.ensure_mr_target(self.repo, *args)
+        return ctx.exception.code
+
+    def test_mr_guard(self):
+        self.prepare("feature/MPS-8-y", "MPS-8")
+        self.write("y.txt", "y\n")
+        self.approve(["y.txt"])
+        self.commit("feat: MPS-8 y", "y.txt")
+        self.assertEqual(mps.ensure_mr_target(self.repo, "feature/MPS-8-y", "develop", "MPS-8", BRANCHES), "develop")
+        self.assertEqual(self.guard_error("feature/MPS-8-y", "release/1.0", "MPS-8", BRANCHES),
+                         "target_mismatch_recorded_base")
+        self.assertEqual(self.guard_error("feature/MPS-8-y", "feature/x", "MPS-8", BRANCHES), "invalid_base")
+        self.assertEqual(self.guard_error("feature/MPS-0-none", "develop", "MPS-8", BRANCHES), "branch_not_found")
+        # m2: without a recorded base the target must be the closest protected branch ...
+        self.git("config", "--unset", "branch.feature/MPS-8-y.mps-base")
+        self.assertEqual(self.guard_error("feature/MPS-8-y", "release/9.9", "MPS-8", BRANCHES), "base_not_found")
+        self.assertEqual(self.guard_error("feature/MPS-8-y", "release/1.0", "MPS-8", BRANCHES),
+                         "target_mismatch_inferred_base")
+        self.assertIsNone(mps.ensure_mr_target(self.repo, "feature/MPS-8-y", "develop", "MPS-8", BRANCHES))
+        # ... and every commit must belong to the ticket.
+        self.assertEqual(self.guard_error("feature/MPS-8-y", "develop", "MPS-9", BRANCHES), "branch_base_mismatch")
+        # ... checked on the pushed branch when there is one (that is what the MR contains).
+        self.mps("git", "push", "--branch=feature/MPS-8-y", "--base=develop")
+        self.git("commit", "-q", "--allow-empty", "-m", "local only, not pushed")
+        self.assertIsNone(mps.ensure_mr_target(self.repo, "feature/MPS-8-y", "develop", "MPS-8", BRANCHES))
+        # The CLI applies the guard before any GitLab call (none is configured here).
+        refused = self.mps("mr", "ensure", "--source=feature/MPS-8-y", "--target=release/1.0", "--title=t",
+                           "--description=Close MPS-8", "--key=MPS-8")
+        self.assertEqual(refused["error"], "target_mismatch_inferred_base")
+
+    def plan(self, *args):
+        return self.mps("flow", "plan", *args)
+
+    def test_flow_plan_dirty_tree_and_ticket_branch(self):
+        # M2: a clean develop does not pin the phase; the user's choice wins.
+        self.assertEqual(self.plan("--type=story", "--key=MPS-9")["error"], "phase_required")
+        clean = self.plan("--type=story", "--key=MPS-9", "--phase=dev")
+        self.assertEqual((clean["phase"], clean["phase_source"]), ("dev", "requested_clean_tree"))
+        self.write("wip.txt", "work\n")
+        dirty = self.plan("--type=story", "--key=MPS-9")
+        self.assertEqual((dirty["phase"], dirty["phase_source"], dirty["target_branch"]), ("dev", "detected", "develop"))
+        self.assertEqual(self.plan("--type=bug", "--key=MPS-9", "--phase=production")["error"], "phase_conflict")
+        os.remove(os.path.join(self.repo, "wip.txt"))
+        # The current ticket's own branch pins its recorded base even when clean.
+        self.prepare("bugfix/MPS-9-z", "MPS-9", "release/1.0")
+        self.assertEqual(self.plan("--type=bug", "--key=MPS-9", "--phase=dev")["error"], "phase_conflict")
+        self.assertEqual(self.plan("--type=story", "--key=MPS-9")["error"], "phase_rule_violation")
+        # M3c: another ticket's branch does not pin anything.
+        other = self.plan("--type=bug", "--key=MPS-10", "--phase=dev")
+        self.assertEqual((other["phase"], other["current_branch_role"]), ("dev", "other"))
+        self.assertIn("other_ticket_branch", [w["code"] for w in other["warnings"]])
+        self.git("switch", "-q", "-c", "my-work")
+        self.assertEqual(self.plan("--type=bug", "--key=MPS-9")["error"], "phase_required")
+
+    def test_flow_plan_recorded_base_gone(self):
+        self.git("push", "-q", "origin", "develop:release/2.0")
+        self.prepare("bugfix/MPS-11-x", "MPS-11", "release/2.0")
+        self.git("push", "-q", "origin", "--delete", "release/2.0")
+        self.git("update-ref", "refs/remotes/origin/release/2.0", "HEAD")  # stale local ref: the pruned fetch clears it
+        clean = self.plan("--type=bug", "--key=MPS-11", "--phase=dev")
+        self.assertEqual((clean["phase"], clean["current_branch_role"]), ("dev", "other"))
+        self.assertIn("recorded_base_gone", [w["code"] for w in clean["warnings"]])
+        self.assertFalse(mps.ref_exists(self.repo, "refs/remotes/origin/release/2.0"))
+        self.write("wip.txt", "work\n")
+        self.assertEqual(self.plan("--type=bug", "--key=MPS-11", "--phase=dev")["error"], "recorded_base_gone")
+
+    def test_flow_plan_detached_head(self):
+        self.git("switch", "-q", "--detach", "origin/develop")
+        self.write("wip.txt", "work\n")
+        plan = self.plan("--type=bug", "--key=MPS-12")
+        self.assertEqual((plan["phase"], plan["base_branch"], plan["detached"]), ("dev", "develop", True))
+        self.git("commit", "-q", "--allow-empty", "-m", "detached work")  # a commit no origin branch points at
+        self.assertEqual(self.plan("--type=bug", "--key=MPS-12", "--phase=dev")["error"], "detached_head")
+
+    def test_flow_plan_beta_with_mocked_gitlab(self):
+        self.write_env(MPS_GITLAB_URL="https://git.example", MPS_GITLAB_PAT="x", MPS_GITLAB_PROJECT="grp/proj")
+        with mock.patch.object(mps, "gitlab_client", return_value=fake_gitlab(["release/1.0", "release/1.1"])):
+            latest = self.plan("--type=bug", "--key=MPS-13", "--phase=beta")
+            self.assertEqual((latest["base_branch"], latest["phase_source"]), ("release/1.1", "requested_clean_tree"))
+            self.git("switch", "-q", "release/1.0")
+            self.write("wip.txt", "work\n")
+            pinned = self.plan("--type=bug", "--key=MPS-13")
+            self.assertEqual((pinned["phase"], pinned["base_branch"], pinned["target_branch"]),
+                             ("beta", "release/1.0", "release/1.0"))
+            self.assertEqual([w["code"] for w in pinned["warnings"]], ["not_latest_release"])
+        with mock.patch.object(mps, "gitlab_client", return_value=fake_gitlab(["release/1.1"])):
+            self.assertEqual(self.plan("--type=bug", "--key=MPS-13")["error"], "release_branch_gone")
+
+    def test_jira_create_on_another_board_with_mocked_jira(self):
+        self.write_env(MPS_JIRA_URL="https://jira.example", MPS_JIRA_PAT="x", MPS_JIRA_PROJECT_KEY="MPS")
+        jira = fake_jira()
+        with mock.patch.object(mps, "jira_client", return_value=jira):
+            created = self.mps("jira", "create", "--type=story", "--summary=Vẽ lại icon", "--project=art")
+            self.assertEqual((created["key"], created["project"]), ("ART-1", "ART"))
+            body = [call[2] for call in jira.calls if call[0] == "POST"][0]
+            self.assertEqual(body["fields"]["project"], {"key": "ART"})
+            self.assertEqual(body["fields"]["assignee"], {"name": "hung"})
+            missing = self.mps("jira", "create", "--type=story", "--summary=x", "--project=NOPE")
+            self.assertEqual(missing["error"], "jira_project_not_found")
+            self.assertEqual([p["key"] for p in missing["available_projects"]], ["ART", "MPS"])
+            default = self.mps("jira", "create", "--type=story", "--summary=x")
+            self.assertEqual(default["project"], "MPS")
+            self.assertNotIn(("GET", "/rest/api/2/project/MPS", None), jira.calls)  # default is not re-validated
+
+    # -- round 2: M1 scope gate, M5 exact paths ----------------------------
+
+    def test_commit_requires_fresh_review(self):
+        self.prepare("feature/MPS-14-a", "MPS-14")
+        self.write("a.txt", "a\n")
+        self.write("b.txt", "b\n")
+        self.assertEqual(self.commit("feat: MPS-14 a", "a.txt")["error"], "scope_review_required")
+        self.approve(["a.txt"], out_of_scope=["b.txt"], mixed=[])
+        self.assertEqual(self.commit("feat: MPS-14 a", "a.txt", "b.txt")["error"], "not_in_scope")
+        self.assertEqual(self.mps("git", "commit", "--message=x", "--files", "a.txt",
+                                  "--include-out-of-scope", "c.txt")["error"], "invalid_include")
+        self.write("a.txt", "a changed after review\n")
+        self.assertEqual(self.commit("feat: MPS-14 a", "a.txt")["error"], "changed_since_review")
+        self.approve(["a.txt"], out_of_scope=["b.txt"])
+        self.git("commit", "-q", "--allow-empty", "-m", "feat: MPS-14 head moved")
+        self.assertEqual(self.commit("feat: MPS-14 a", "a.txt")["error"], "scope_review_required")
+        self.approve(["a.txt"], out_of_scope=["b.txt"])
+        # The user explicitly named b.txt: it may be included.
+        done = self.mps("git", "commit", "--message=feat: MPS-14 a", "--files", "a.txt", "b.txt",
+                        "--include-out-of-scope", "b.txt")
+        self.assertEqual(sorted(done["files"]), ["A\ta.txt", "A\tb.txt"])
+        self.assertFalse(os.path.exists(mps.scope_path(self.repo)))
+
+    def test_mixed_and_needs_decision_require_explicit_choice(self):
+        self.prepare("feature/MPS-15-a", "MPS-15")
+        self.write("a.txt", "a\n")
+        self.write("m.txt", "m\n")
+        self.write("c.txt", "c\n")
+        result = self.approve(["a.txt"], mixed=["m.txt"], concern=["c.txt"], verdict="FAIL")
+        self.assertEqual((result["commit_files"], result["needs_decision"], result["mixed_files"]),
+                         (["a.txt"], ["c.txt"], ["m.txt"]))
+        self.assertEqual(self.commit("feat: MPS-15 a", "a.txt", "m.txt")["error"], "not_in_scope")
+        self.assertEqual(self.commit("feat: MPS-15 a", "a.txt", "c.txt")["error"], "not_in_scope")
+
+    def test_deleted_folder_is_not_accepted(self):
+        self.prepare("feature/MPS-16-cleanup", "MPS-16")
+        self.write("Assets/Old/a.txt", "a\n")
+        self.write("Assets/Old/b.txt", "b\n")
+        self.git("add", "Assets")
+        self.git("commit", "-q", "-m", "feat: MPS-16 add old assets")
+        shutil.rmtree(os.path.join(self.repo, "Assets"))
+        refused = self.commit("feat: MPS-16 cleanup", "Assets/Old")
+        self.assertEqual(refused["error"], "explicit_files_required")
+        self.assertEqual((refused["files"], refused["changed_files_inside"]),
+                         (["Assets/Old"], ["Assets/Old/a.txt", "Assets/Old/b.txt"]))
+        self.approve(["Assets/Old/a.txt", "Assets/Old/b.txt"])
+        done = self.commit("feat: MPS-16 cleanup", "Assets/Old/a.txt", "Assets/Old/b.txt")
+        self.assertEqual(sorted(done["files"]), ["D\tAssets/Old/a.txt", "D\tAssets/Old/b.txt"])
 
 
 if __name__ == "__main__":
