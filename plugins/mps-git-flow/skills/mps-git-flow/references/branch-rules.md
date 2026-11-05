@@ -29,12 +29,21 @@ These rules are enforced by `mps.py flow plan` and `mps.py naming build`. Branch
 
 The detected phase is binding ("pinned") only when work sits on the current branch - uncommitted changes or
 commits not on any origin branch - or when it is the current ticket's own branch. Changes to files that tools
-rewrite on their own do not count as work: `ProjectSettings/**`, `Packages/packages-lock.json`,
-`UserSettings/**`, `*.csproj`, `*.sln`, `Library/**` (also inside a Unity project in a sub-folder), plus the
-comma-separated globs in `MPS_GENERATED_PATTERNS` (`**` = any path, `*` = within one folder). `flow plan` lists
-them as `generated_changes`. This only affects choosing the phase: those files still go through the scope review
-and are committed only if in scope or named by the user, and `prepare-branch` carries them along with the other
-changes as usual. Then a different `--phase`
+rewrite on their own do not count as work:
+- Unity defaults, only inside a Unity project root (the repo root or a sub-folder that contains
+  `ProjectSettings/ProjectVersion.txt`, tracked or present on disk): `ProjectSettings/**`, `UserSettings/**`,
+  `Library/**`, `Packages/packages-lock.json`, and `*.csproj` / `*.sln` directly in that root. Patterns are
+  anchored to the root, so `Assets/Plugins/Library/Core.cs` is real work. Without any Unity project root the
+  defaults are not used at all (in a non-Unity repo `*.sln` / `*.csproj` are real work).
+- The comma-separated globs in `MPS_GENERATED_PATTERNS` (`**` = any path, `*` = within one folder), anchored to
+  the repo root and to every Unity project root. Each must start with a literal folder or file name
+  (`Assets/Gen/**`, `yarn.lock`); wildcard-only or wildcard-first ones (`*`, `**/*`, `*/Gen/**`, `*.cs`) are
+  ignored and reported as `invalid_generated_pattern` (`env check`, `flow plan`). Only the user edits this key by
+  hand in `.env`; `env set` refuses it.
+
+`flow plan` lists such files as `generated_changes`. This only affects choosing the phase: those files still go
+through the scope review and are committed only if in scope or named by the user, and `prepare-branch` carries
+them along with the other changes as usual. Then a different `--phase`
 fails with `phase_conflict`: changes made on one phase's branch are never moved to another phase silently (a
 developer must do that). On a clean tree nothing has been done on the current branch yet, so the user's chosen
 phase is used (`phase_source: "requested_clean_tree"`); without a choice `flow plan` returns `phase_required`.
@@ -52,7 +61,10 @@ always be develop, master or a release/* branch (`invalid_base`).
 
 `git push` also records the pushed commit (`branch.<name>.mps-pushed`). When GitLab squash-merges and deletes
 the ticket branch, `fetch --prune` removes `origin/<name>` and its commits are on no remote branch any more; the
-record keeps them from being counted as unpushed work (`local_commits_not_carried`, phase pinning).
+record keeps them from being counted as unpushed work (`local_commits_not_carried`, phase pinning) - but only
+when their changes really are in `origin/<recorded base>` (equivalent patches per `git cherry`, or, after a
+squash, identical content for every path the branch changed). If the MR was closed without merging, the commits
+count again and are never left behind silently.
 
 - Only two Jira issue types exist in this team: **Story** and **Bug**. Anything else is rejected
   (`unsupported_type`).

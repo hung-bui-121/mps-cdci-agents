@@ -56,7 +56,7 @@ Bạn **tự điền token bằng trình soạn thảo** (Notepad, VS Code...). 
 | `MPS_BRANCH_BETA_PREFIX` | Tiền tố nhánh beta (mặc định `release/`) |
 | `MPS_BRANCH_PROD` | Nhánh production (mặc định `master`) |
 | `MPS_CA_BUNDLE` | (Tuỳ chọn) đường dẫn file chứng chỉ CA nội bộ nếu gặp lỗi SSL |
-| `MPS_GENERATED_PATTERNS` | (Tuỳ chọn) thêm mẫu file do công cụ tự sửa, cách nhau bằng dấu phẩy (ví dụ `Assets/Gen/**`). Mặc định đã có các file Unity tự sửa (`ProjectSettings/**`, `Packages/packages-lock.json`, `UserSettings/**`, `*.csproj`, `*.sln`, `Library/**`). Chúng không ảnh hưởng việc chọn giai đoạn, nhưng vẫn được review và không tự động commit |
+| `MPS_GENERATED_PATTERNS` | (Tuỳ chọn, chỉ bạn tự sửa trong `.env`) thêm mẫu file do công cụ tự sửa, cách nhau bằng dấu phẩy, mỗi mẫu bắt đầu bằng tên thư mục/file cụ thể (ví dụ `Assets/Gen/**`, `yarn.lock`; mẫu như `*` bị bỏ qua). Trong project Unity (có `ProjectSettings/ProjectVersion.txt`) đã có sẵn các file Unity tự sửa (`ProjectSettings/**`, `Packages/packages-lock.json`, `UserSettings/**`, `Library/**`, `*.csproj`, `*.sln`). Chúng không ảnh hưởng việc chọn giai đoạn, nhưng vẫn được review và không tự động commit |
 
 Lưu ý: giá trị trong `.env` là nguồn duy nhất - biến môi trường của hệ điều hành không được dùng. Các khoá
 đều có tiền tố `MPS_` để không đụng với `.env` riêng của ứng dụng.

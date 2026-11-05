@@ -115,10 +115,14 @@ team's board) - the ticket's project does not have to match the GitLab project.
 
 A change made on branch X always goes back into X. Run `flow plan --type=<story|bug> --key=<KEY>` WITHOUT
 `--phase` first (it fetches from GitLab with `--prune`, so deleted branches are noticed):
-- Files tools rewrite on their own (Unity `ProjectSettings/**`, `UserSettings/**`, `Library/**`,
-  `Packages/packages-lock.json`, `*.csproj`, `*.sln`, plus `MPS_GENERATED_PATTERNS`) do not count as work here.
-  If `generated_changes` is non-empty, mention them briefly ("Unity tự sửa các file này, không ảnh hưởng việc
-  chọn giai đoạn"). They are still classified by the scope review in step 6 and never committed automatically.
+- Files tools rewrite on their own do not count as work here: inside a Unity project root (a folder with
+  `ProjectSettings/ProjectVersion.txt`) its `ProjectSettings/**`, `UserSettings/**`, `Library/**`,
+  `Packages/packages-lock.json` and the `*.csproj` / `*.sln` directly in it, plus the user's own
+  `MPS_GENERATED_PATTERNS`. A folder that only has the same name deeper down (`Assets/Plugins/Library/...`) is
+  real work. If `generated_changes` is non-empty, mention them briefly ("Unity tự sửa các file này, không ảnh
+  hưởng việc chọn giai đoạn"). They are still classified by the scope review in step 6 and never committed
+  automatically. A warning `invalid_generated_pattern` lists patterns from `.env` that were ignored; tell the
+  user (they fix `.env` themselves).
 - The current branch pins the phase only when work sits on it (other uncommitted changes or unpushed commits,
   `work_in_progress`) or when it is THIS ticket's own branch made by this skill: `develop` -> dev, any
   `release/*` -> beta (that exact release branch, even if not the newest), `master` -> production, own ticket
@@ -303,6 +307,8 @@ already done. If a run stopped half way, re-run from step 1.
   user chose), `needs_decision` and unclassified files are never committed; such a file is included (via
   `--include-out-of-scope`) only when the user names that file explicitly.
 - The MR always targets the branch the work was based on; never move changes to another phase's branch.
+- Never add, change or suggest `MPS_GENERATED_PATTERNS` (or any other setting) to get around `phase_conflict`;
+  `env set` refuses that key on purpose - only the user edits it in `.env`.
 - Never skip the confirmation step (7); never commit before the scope review (6).
 - Never merge, approve or close merge requests - only create them.
 - Never write temp files into the working tree; use `tmp_dir`.
