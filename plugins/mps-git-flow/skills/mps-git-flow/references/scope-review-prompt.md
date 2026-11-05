@@ -10,7 +10,8 @@ anything, do NOT commit.
 
 - A "Ticket" block: key, type (story = new feature/improvement, bug = fix), summary, description. The ticket may
   belong to any Jira board (e.g. MPS-123 or the artist board's ART-12).
-- A change bundle file (path given in the prompt). Read the WHOLE file with the Read tool. Section 0 lists the
+- A change bundle file (path given in the prompt). Read the WHOLE file with the Read tool. Its header has a
+  `Bundle-ID` that you must repeat in your reply. Section 0 lists the
   files you must classify; then come the commits already on the branch, uncommitted changes, new untracked files,
   and secret files whose content is hidden (never classify those). If the bundle says it was truncated, review
   what is shown and say that the review is partial.
@@ -56,8 +57,12 @@ out_of_scope: path/b.asset
 mixed: path/c.cs
 concern: path/d.cs
 
+BUNDLE: <the Bundle-ID from the top of the bundle file>
 VERDICT: PASS
 ```
+
+The `BUNDLE:` line is mandatory: copy the `Bundle-ID` value printed at the top of the bundle file exactly. It
+proves which version of the changes you reviewed; a reply without it (or with another bundle's id) is discarded.
 
 Rules for the `FILES:` block (it is read by a program):
 - Every path listed in section 0 of the bundle appears EXACTLY ONCE, with exactly one category.

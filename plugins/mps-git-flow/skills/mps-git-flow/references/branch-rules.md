@@ -28,7 +28,13 @@ These rules are enforced by `mps.py flow plan` and `mps.py naming build`. Branch
 | detached HEAD anywhere else | `detached` | ask the user (error `detached_head` if there are changes) | per the phase table |
 
 The detected phase is binding ("pinned") only when work sits on the current branch - uncommitted changes or
-commits not on any origin branch - or when it is the current ticket's own branch. Then a different `--phase`
+commits not on any origin branch - or when it is the current ticket's own branch. Changes to files that tools
+rewrite on their own do not count as work: `ProjectSettings/**`, `Packages/packages-lock.json`,
+`UserSettings/**`, `*.csproj`, `*.sln`, `Library/**` (also inside a Unity project in a sub-folder), plus the
+comma-separated globs in `MPS_GENERATED_PATTERNS` (`**` = any path, `*` = within one folder). `flow plan` lists
+them as `generated_changes`. This only affects choosing the phase: those files still go through the scope review
+and are committed only if in scope or named by the user, and `prepare-branch` carries them along with the other
+changes as usual. Then a different `--phase`
 fails with `phase_conflict`: changes made on one phase's branch are never moved to another phase silently (a
 developer must do that). On a clean tree nothing has been done on the current branch yet, so the user's chosen
 phase is used (`phase_source: "requested_clean_tree"`); without a choice `flow plan` returns `phase_required`.
@@ -38,9 +44,15 @@ phase is used (`phase_source: "requested_clean_tree"`); without a choice `flow p
 `mr ensure` refuses a target other than the recorded base (`target_mismatch_recorded_base`). Without a recorded
 base (branch made by hand or on another machine) the target must be the protected branch the source is closest
 to - fewest commits in `origin/X..source` among develop, master and the existing release branches - else
-`target_mismatch_inferred_base`. `mr ensure` also checks that every non-merge commit in `origin/<target>..<source>`
-mentions the ticket key (`branch_base_mismatch`), using the pushed branch when there is one. Bases and targets
-must always be develop, master or a release/* branch (`invalid_base`).
+`target_mismatch_inferred_base`; if several are equally close (a tie), only develop is accepted
+(`target_ambiguous`). `mr ensure` also checks that every non-merge commit in `origin/<target>..<source>`
+mentions the ticket key (`branch_base_mismatch`), using the pushed branch when there is one, and re-applies the
+phase rules to the target with `--type` (a Story never goes into release/* or master). Bases and targets must
+always be develop, master or a release/* branch (`invalid_base`).
+
+`git push` also records the pushed commit (`branch.<name>.mps-pushed`). When GitLab squash-merges and deletes
+the ticket branch, `fetch --prune` removes `origin/<name>` and its commits are on no remote branch any more; the
+record keeps them from being counted as unpushed work (`local_commits_not_carried`, phase pinning).
 
 - Only two Jira issue types exist in this team: **Story** and **Bug**. Anything else is rejected
   (`unsupported_type`).
@@ -102,7 +114,10 @@ of every file): in-scope files (plus concern files on a PASS verdict) are commit
 Unity-regenerated `ProjectSettings/*.asset` / `.meta`, lock files, someone else's edits, IDE files - stay modified
 on the user's machine and are reported as `left_uncommitted`. A file outside the approved list is committed only
 when the user named it (`--include-out-of-scope`). Editing a file after the review (`changed_since_review`) or
-committing in between (`scope_review_required`) requires a new review; each review approves one commit.
+committing in between (`scope_review_required`) requires a new review; each review approves one commit. The
+review is bound to the bundle the reviewer read: `git diff-for-review` stamps a `Bundle-ID` and fingerprints
+every file, the reply must quote it (`BUNDLE: <id>`), and `review classify` rejects replies for older bundles or
+for files changed since (`review_stale`). Incomplete classifications approve nothing (`scope_incomplete`).
 
 ## Protected branches
 

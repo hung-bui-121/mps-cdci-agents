@@ -56,11 +56,11 @@ The CLI is `"<SKILL_DIR>/scripts/mps.py"`; references are in `<SKILL_DIR>/refere
 | `git preflight --base=B --branch=N` | status, branch role + `blockers` (must stop) + `warnings` |
 | `git set-identity --name=N --email=E` | set the repo-local git name/email (only with the user's consent) |
 | `git prepare-branch --base=B --branch=N --key=K [--leave-commits]` | fetch, switch to / create the ticket branch, record its base |
-| `git diff-for-review --base=B --to-file` | write the change bundle for the scope reviewer, return its path |
+| `git diff-for-review --base=B --to-file` | write the change bundle (a snapshot with a `Bundle-ID`) for the scope reviewer |
 | `review classify --base=B --result-file=F` | check the reviewer's `FILES:` block, derive commit / exclude lists, save them |
 | `git commit --message=M --files f1 f2 ... [--include-out-of-scope f ...]` | commit exactly those reviewed files |
 | `git push --branch=N --base=B` | check every commit vs origin/B for .env/secrets, then push (never forced) |
-| `mr ensure --source=S --target=T --title=X --description=D --key=K` | verify target = recorded base, then reuse / create the MR |
+| `mr ensure --source=S --target=T --title=X --description=D --key=K --type=story\|bug` | verify target = recorded base, then reuse / create the MR |
 
 ## Workflow
 
@@ -115,7 +115,11 @@ team's board) - the ticket's project does not have to match the GitLab project.
 
 A change made on branch X always goes back into X. Run `flow plan --type=<story|bug> --key=<KEY>` WITHOUT
 `--phase` first (it fetches from GitLab with `--prune`, so deleted branches are noticed):
-- The current branch pins the phase only when work sits on it (uncommitted changes or unpushed commits,
+- Files tools rewrite on their own (Unity `ProjectSettings/**`, `UserSettings/**`, `Library/**`,
+  `Packages/packages-lock.json`, `*.csproj`, `*.sln`, plus `MPS_GENERATED_PATTERNS`) do not count as work here.
+  If `generated_changes` is non-empty, mention them briefly ("Unity tự sửa các file này, không ảnh hưởng việc
+  chọn giai đoạn"). They are still classified by the scope review in step 6 and never committed automatically.
+- The current branch pins the phase only when work sits on it (other uncommitted changes or unpushed commits,
   `work_in_progress`) or when it is THIS ticket's own branch made by this skill: `develop` -> dev, any
   `release/*` -> beta (that exact release branch, even if not the newest), `master` -> production, own ticket
   branch -> the phase of its `recorded_base`. A detached HEAD sitting exactly on one of them counts as that
@@ -161,8 +165,10 @@ Run `git preflight --base=<base_branch> --branch=<branch>`.
     With the user's OK run `git set-identity --name="..." --email="..."`, then re-run preflight.
   - `possible_secret` (`confirmable: true`): open each `file:line`, show the user the line with the value
     masked, and continue only if the user confirms it is not a real password/token.
-- Warnings: `local_commits_not_carried` means the current branch has commits that were never pushed and the
-  new ticket branch will NOT contain them (they stay safe on the old branch). Explain this; recommend asking a
+- Warnings: `local_commits_not_carried` means the current branch has commits that are on no GitLab branch
+  (usually never pushed; commits this skill pushed earlier are not counted, even after GitLab deleted the merged
+  branch) and the new ticket branch will NOT contain them (they stay safe on the old branch). Explain this;
+  recommend asking a
   developer. Only if the user explicitly agrees to leave them behind, add `--leave-commits` below. Mention other
   warnings briefly (e.g. `nothing_to_commit`).
 
@@ -184,21 +190,29 @@ Only what was intentionally changed for this ticket gets committed. Anything els
 `ProjectSettings`/`.meta` files, lock files, someone else's edits, IDE files) stays on the user's machine,
 untouched, and is NOT committed - so it cannot affect other people.
 
-1. `git diff-for-review --base=<base_branch> --to-file` -> `bundle_path` (inside `.git`, never committed).
-   Section 0 of the bundle lists the files to classify (`files_to_classify` = uncommitted changes,
-   `already_committed_files` = earlier commits on this branch). `.env` files appear only as "[content hidden]".
+1. `git diff-for-review --base=<base_branch> --to-file` -> `bundle_path` (inside `.git`, never committed) and
+   `bundle_id`. The bundle is a snapshot: its header carries `Bundle-ID`, and the script remembers the exact
+   content of every file in it. Section 0 lists the files to classify (`files_to_classify` = uncommitted
+   changes, `already_committed_files` = earlier commits on this branch). `.env` files appear only as
+   "[content hidden]". Do not edit any project file between this step and the commit; if anything must change
+   (e.g. trimming a mixed file), make the change and start again from this step.
 2. Read `references/scope-review-prompt.md`.
 3. Launch ONE subagent with the Agent tool, `subagent_type: "general-purpose"` (do not rely on custom agents;
    teammates may not have them). Prompt = the full text of scope-review-prompt.md + a "Ticket" block (key, type,
    summary, description) + "The change bundle is at <bundle_path>; read the whole file with the Read tool."
-   If `truncated` is true, say so in the prompt.
-4. Save the reviewer's full reply to `<tmp_dir>/review.txt` and run
-   `review classify --base=<base_branch> --result-file=<tmp_dir>/review.txt`. It saves the decisions (and a
-   fingerprint of every file) in `<tmp_dir>/scope.json`; `git commit` only accepts files approved there and
-   unchanged since. Any edit to a file, or a new commit, means running the review + classify again.
+   If `truncated` is true, say so in the prompt. The reply must contain `BUNDLE: <id>` with the bundle's id.
+4. Save the reviewer's full reply (as received, never edited by you) to `<tmp_dir>/review.txt` and run
+   `review classify --base=<base_branch> --result-file=<tmp_dir>/review.txt`. It only accepts a reply for the
+   latest bundle while nothing has changed since that bundle, then saves the decisions with the fingerprints
+   the reviewer saw in `<tmp_dir>/scope.json`. `git commit` only accepts files approved there whose content is
+   still exactly what was reviewed. Any edit to a file, or a new commit, means starting step 6 again.
+   - `review_stale` (`reason`: reply for an older bundle, reply without the `BUNDLE:` line, files / branch /
+     HEAD changed since the bundle) -> run `git diff-for-review` again and get a fresh review of the new bundle.
+     Never reuse an old reply and never add the `BUNDLE:` line yourself.
    - `complete: false` (`unclassified_files`, `unknown_paths`, `duplicate_paths`, missing verdict) or
-     `review_unparsable` -> ask the reviewer (same subagent via SendMessage, or a new one) to fix its reply;
-     never guess. `unclassified_files` are never committed by default.
+     `review_unparsable` -> ask the reviewer (same subagent via SendMessage, or a new one) to fix its reply for
+     the same bundle; never guess. Until the classification is complete, `git commit` refuses with
+     `scope_incomplete` (also for `--include-out-of-scope`). `unclassified_files` are never committed.
    - Default commit set = `commit_files`: in_scope files, plus concern files when the verdict is PASS.
      `excluded_files` (out_of_scope) are left out.
    - `needs_decision` (concern files under a FAIL verdict) and `concern_files`: show each concern and ask the
@@ -232,10 +246,12 @@ file, and then pass it in both `--files` and `--include-out-of-scope`. Never add
 1. `git commit --message="<commit_message>" --files <agreed files> [--include-out-of-scope <files the user named>]`
    - always the explicit agreed list of exact file paths.
    - `scope_review_required` (no review, or the branch/HEAD changed since) / `changed_since_review` (a file was
-     edited after the review) -> run step 6 again. `not_in_scope` -> the file was not approved; ask the user.
+     edited after the reviewer saw it) / `scope_incomplete` -> run step 6 again. `not_in_scope` -> the file was
+     not approved; ask the user.
    - `explicit_files_required`: a folder, `.` or a path that is not a changed file was passed; list the
      individual changed files instead (`changed_files_inside`).
-   - `nothing_to_commit` is fine if the branch already has the commits (resuming an earlier run).
+   - `nothing_to_commit` is fine when resuming an earlier run: either nothing is changed, or the requested files
+     are already committed on this branch (`already_committed`) while other files stay uncommitted.
    - `env_file` / `secret_detected`: nothing was committed; explain and stop.
    - A successful commit consumes the review; a later commit needs a new review.
    - Keep `left_uncommitted` (changed files still not committed) for the final report. Relay
@@ -244,10 +260,12 @@ file, and then pass it in both `--files` and `--include-out-of-scope`. Never add
    commit about to be published, and `base_mismatch` if the base differs from the recorded one.
    `push_rejected` -> explain; never force. Auth errors -> troubleshooting.
 3. `mr ensure --source=<branch> --target=<base_branch> --title="<mr_title>" --description="<mr_description>"
-   --key=<KEY>`. The target is ALWAYS the base the branch was made from.
+   --key=<KEY> --type=<story|bug>`. The target is ALWAYS the base the branch was made from, and the phase rules
+   are checked again for it (`phase_rule_violation`: a Story never goes into release/* or master).
    - `existed: true` means the MR was already there.
-   - `target_mismatch_recorded_base` / `target_mismatch_inferred_base` / `branch_base_mismatch` /
-     `mr_target_mismatch` -> stop and ask a developer; do not create or change MRs yourself.
+   - `target_mismatch_recorded_base` / `target_mismatch_inferred_base` / `target_ambiguous` (no recorded base and
+     several possible bases; only develop is accepted then) / `branch_base_mismatch` / `mr_target_mismatch` ->
+     stop and ask a developer; do not create or change MRs yourself.
    - `invalid_base` (target is not develop/master/release/*), `base_not_found` (origin/<target> missing),
      `branch_not_found` (the source branch is neither local nor pushed) -> re-check the plan from step 3; push
      first if the branch was not pushed.
