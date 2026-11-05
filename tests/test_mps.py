@@ -422,18 +422,20 @@ class ReviewClassifyTests(unittest.TestCase):
         "- concern: `src/debug.cs`",
         "in_scope: src/login.cs",
         "in_scope: not/in/bundle.cs",
+        "",
+        "BUNDLE: `AB12CD`",
         "VERDICT: FAIL",
     ])
 
     def test_parse_review_files(self):
-        entries, verdict = mps.parse_review_files(self.REPLY)
-        self.assertEqual(verdict, "FAIL")
+        entries, verdict, bundle_id = mps.parse_review_files(self.REPLY)
+        self.assertEqual((verdict, bundle_id), ("FAIL", "ab12cd"))
         self.assertEqual(entries[0], ("in_scope", "src/login.cs"))
         self.assertEqual(entries[3], ("concern", "src/debug.cs"))
         self.assertEqual(len(entries), 6)
 
     def test_classify_review(self):
-        entries, _ = mps.parse_review_files(self.REPLY)
+        entries, _, _ = mps.parse_review_files(self.REPLY)
         uncommitted = ["src/login.cs", "ProjectSettings/ProjectSettings.asset", "src/menu.cs", "src/debug.cs",
                        "package-lock.json"]
         result = mps.classify_review(entries, uncommitted, ["src/old.cs"], "PASS")
@@ -448,14 +450,14 @@ class ReviewClassifyTests(unittest.TestCase):
         self.assertFalse(result["complete"])
 
     def test_complete_classification(self):
-        entries, verdict = mps.parse_review_files("FILES:\nin_scope: a.cs\nout_of_scope: b.meta\nVERDICT: PASS\n")
+        entries, verdict, _ = mps.parse_review_files("FILES:\nin_scope: a.cs\nout_of_scope: b.meta\nVERDICT: PASS\n")
         result = mps.classify_review(entries, ["a.cs", "b.meta"], [], verdict)
         self.assertTrue(result["complete"])
         self.assertEqual(verdict, "PASS")
         self.assertEqual(result["commit_files"], ["a.cs"])
 
     def test_fail_verdict_moves_concerns_to_needs_decision(self):
-        entries, verdict = mps.parse_review_files("FILES:\nin_scope: a.cs\nconcern: d.cs\nVERDICT: FAIL\n")
+        entries, verdict, _ = mps.parse_review_files("FILES:\nin_scope: a.cs\nconcern: d.cs\nVERDICT: FAIL\n")
         result = mps.classify_review(entries, ["a.cs", "d.cs"], [], verdict)
         self.assertEqual((result["commit_files"], result["needs_decision"]), (["a.cs"], ["d.cs"]))
         self.assertTrue(result["complete"])
@@ -464,7 +466,31 @@ class ReviewClassifyTests(unittest.TestCase):
         self.assertFalse(no_verdict["complete"])
 
     def test_no_files_block(self):
-        self.assertEqual(mps.parse_review_files("in_scope: a.cs\nVERDICT: PASS"), ([], "PASS"))
+        self.assertEqual(mps.parse_review_files("in_scope: a.cs\nVERDICT: PASS"), ([], "PASS", None))
+
+    def test_stale_bundle_reason(self):
+        bundle = {"bundle_id": "ab12", "base": "develop", "branch": "feature/X-1-a", "head": "h1",
+                  "blobs": {"a.txt": "b1"}}
+        ok_args = ("develop", "feature/X-1-a", "h1", {"a.txt": "b1"})
+        self.assertIsNone(mps.stale_bundle_reason(bundle, "ab12", *ok_args))
+        self.assertEqual(mps.stale_bundle_reason(None, "ab12", *ok_args), "no_bundle")
+        self.assertEqual(mps.stale_bundle_reason(bundle, None, *ok_args), "reply_without_bundle_id")
+        self.assertEqual(mps.stale_bundle_reason(bundle, "ffff", *ok_args), "reply_for_other_bundle")
+        self.assertEqual(mps.stale_bundle_reason(bundle, "ab12", "release/1.0", "feature/X-1-a", "h1",
+                                                 {"a.txt": "b1"}), "base_changed")
+        self.assertEqual(mps.stale_bundle_reason(bundle, "ab12", "develop", "feature/X-1-a", "h2",
+                                                 {"a.txt": "b1"}), "branch_or_commit_changed")
+        self.assertEqual(mps.stale_bundle_reason(bundle, "ab12", "develop", "feature/X-1-a", "h1",
+                                                 {"a.txt": "b2"}), "files_changed")
+        self.assertEqual(mps.stale_bundle_reason(bundle, "ab12", "develop", "feature/X-1-a", "h1",
+                                                 {"a.txt": "b1", "new.txt": "b3"}), "files_changed")
+
+    def test_inferred_target_verdict(self):
+        self.assertEqual(mps.inferred_target_verdict("develop", ["develop"], "develop"), "ok")
+        self.assertEqual(mps.inferred_target_verdict("release/1.0", ["develop"], "develop"), "mismatch")
+        self.assertEqual(mps.inferred_target_verdict("develop", ["develop", "master"], "develop"), "ok")
+        self.assertEqual(mps.inferred_target_verdict("master", ["develop", "master"], "develop"), "ambiguous")
+        self.assertEqual(mps.inferred_target_verdict("release/1.0", ["release/1.0"], "develop"), "ok")
 
 
 class BranchContextTests(unittest.TestCase):
@@ -546,6 +572,42 @@ class BranchContextTests(unittest.TestCase):
         self.assertEqual(mps.closest_bases({}), [])
         self.assertEqual(mps.ticket_key_of_branch("bugfix/art-12-x"), "ART-12")
         self.assertIsNone(mps.ticket_key_of_branch("develop"))
+
+
+class GeneratedFilesTests(unittest.TestCase):
+    """Tool-generated files (Unity) never make the current branch 'hold work' for phase pinning."""
+
+    DEFAULTS = mps.DEFAULT_GENERATED_PATTERNS
+
+    def test_default_patterns(self):
+        generated = ["ProjectSettings/ProjectSettings.asset", "ProjectSettings/Sub/Deep.asset",
+                     "Packages/packages-lock.json", "UserSettings/EditorUserSettings.asset", "Game.csproj",
+                     "Assembly-CSharp.csproj", "Game.sln", "Library/ScriptAssemblies/x.dll"]
+        for path in generated:
+            self.assertTrue(mps.is_generated_path(path, self.DEFAULTS), path)
+        real = ["Assets/Scripts/Login.cs", "Packages/manifest.json", "Docs/ProjectSettings.md",
+                "ProjectSettingsBackup/x.asset", "src/Game.csproj.bak", "LibraryCode/a.cs"]
+        for path in real:
+            self.assertFalse(mps.is_generated_path(path, self.DEFAULTS), path)
+
+    def test_windows_paths_and_nested_unity_project(self):
+        self.assertTrue(mps.is_generated_path("ProjectSettings\\TagManager.asset", self.DEFAULTS))
+        self.assertTrue(mps.is_generated_path("Client/Game/ProjectSettings/TagManager.asset", self.DEFAULTS))
+        self.assertTrue(mps.is_generated_path("Client\\Game\\Packages\\packages-lock.json", self.DEFAULTS))
+        self.assertTrue(mps.is_generated_path("Client/Game/Game.csproj", self.DEFAULTS))
+        self.assertFalse(mps.is_generated_path("Client/Game/Assets/a.cs", self.DEFAULTS))
+
+    def test_extra_patterns_from_env(self):
+        patterns = mps.generated_patterns(" Assets/Gen/** , *.lock ,Assets\\AddressableAssetsData\\*.json,")
+        self.assertEqual(patterns[:len(self.DEFAULTS)], list(self.DEFAULTS))
+        self.assertEqual(patterns[len(self.DEFAULTS):],
+                         ["Assets/Gen/**", "*.lock", "Assets/AddressableAssetsData/*.json"])
+        self.assertTrue(mps.is_generated_path("Assets/Gen/a/b.cs", patterns))
+        self.assertTrue(mps.is_generated_path("yarn.lock", patterns))
+        self.assertTrue(mps.is_generated_path("Assets/AddressableAssetsData/settings.json", patterns))
+        self.assertFalse(mps.is_generated_path("Assets/AddressableAssetsData/Sub/settings.json", patterns))
+        self.assertEqual(mps.generated_patterns(None), list(self.DEFAULTS))
+        self.assertIn("MPS_GENERATED_PATTERNS", mps.KNOWN_KEYS)
 
 
 GIT = shutil.which("git")
@@ -682,17 +744,31 @@ class GitFlowTests(unittest.TestCase):
     def prepare(self, branch, key, base="develop", *extra):
         return self.mps("git", "prepare-branch", "--base", base, "--branch", branch, "--key", key, *extra)
 
-    def approve(self, in_scope, base="develop", out_of_scope=(), mixed=(), concern=(), verdict="PASS"):
-        """Simulate the scope reviewer's reply and run `review classify` (writes scope.json)."""
+    def make_bundle(self, base="develop"):
+        return self.mps("git", "diff-for-review", "--base=" + base, "--to-file")["bundle_id"]
+
+    def write_reply(self, bundle_id, in_scope, out_of_scope=(), mixed=(), concern=(), verdict="PASS", name="review"):
+        """A scope reviewer's reply in the required format; bundle_id/verdict None leave that line out."""
         lines = ["FILES:"]
         for category, paths in (("in_scope", in_scope), ("out_of_scope", out_of_scope), ("mixed", mixed),
                                 ("concern", concern)):
             lines.extend("%s: %s" % (category, path) for path in paths)
-        lines.append("VERDICT: " + verdict)
-        reply = os.path.join(mps.mps_tmp_dir(self.repo), "review.txt")
+        if bundle_id:
+            lines.append("BUNDLE: " + bundle_id)
+        if verdict:
+            lines.append("VERDICT: " + verdict)
+        reply = os.path.join(mps.mps_tmp_dir(self.repo), name + ".txt")
         with open(reply, "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")
+        return reply
+
+    def classify(self, reply, base="develop"):
         return self.mps("review", "classify", "--base=" + base, "--result-file=" + reply)
+
+    def approve(self, in_scope, base="develop", **reply_args):
+        """diff-for-review, a reviewer reply for that bundle, then `review classify` (writes scope.json)."""
+        bundle_id = self.make_bundle(base)
+        return self.classify(self.write_reply(bundle_id, in_scope, **reply_args), base)
 
     def commit(self, message, *files):
         return self.mps("git", "commit", "--message=" + message, "--files", *files)
@@ -898,12 +974,12 @@ class GitFlowTests(unittest.TestCase):
         self.assertEqual(sorted(review["files_to_classify"]),
                          ["ProjectSettings/ProjectSettings.asset", "app.txt", "src/login.cs"])
         with open(review["bundle_path"], encoding="utf-8") as handle:
-            self.assertIn("## 0. Files to classify", handle.read())
-        reply = os.path.join(mps.mps_tmp_dir(self.repo), "review.txt")
-        with open(reply, "w", encoding="utf-8") as handle:
-            handle.write("FILES:\nin_scope: src/login.cs\nout_of_scope: ProjectSettings/ProjectSettings.asset\n"
-                         "out_of_scope: app.txt\nVERDICT: FAIL\n")
-        classified = self.mps("review", "classify", "--base=develop", "--result-file=" + reply)
+            text = handle.read()
+        self.assertIn("## 0. Files to classify", text)
+        self.assertIn("Bundle-ID: " + review["bundle_id"], text)
+        reply = self.write_reply(review["bundle_id"], ["src/login.cs"],
+                                 out_of_scope=["ProjectSettings/ProjectSettings.asset", "app.txt"], verdict="FAIL")
+        classified = self.classify(reply)
         self.assertTrue(classified["complete"])
         self.assertEqual(classified["commit_files"], ["src/login.cs"])
         # M1: an excluded file cannot slip into the commit just by being listed.
@@ -965,8 +1041,12 @@ class GitFlowTests(unittest.TestCase):
         self.assertIsNone(mps.ensure_mr_target(self.repo, "feature/MPS-8-y", "develop", "MPS-8", BRANCHES))
         # The CLI applies the guard before any GitLab call (none is configured here).
         refused = self.mps("mr", "ensure", "--source=feature/MPS-8-y", "--target=release/1.0", "--title=t",
-                           "--description=Close MPS-8", "--key=MPS-8")
+                           "--description=Close MPS-8", "--key=MPS-8", "--type=bug")
         self.assertEqual(refused["error"], "target_mismatch_inferred_base")
+        # m3: a Story can never go into a release branch, whatever the branches say.
+        story = self.mps("mr", "ensure", "--source=feature/MPS-8-y", "--target=release/1.0", "--title=t",
+                         "--description=Close MPS-8", "--key=MPS-8", "--type=story")
+        self.assertEqual(story["error"], "phase_rule_violation")
 
     def plan(self, *args):
         return self.mps("flow", "plan", *args)
@@ -1090,6 +1170,124 @@ class GitFlowTests(unittest.TestCase):
         self.approve(["Assets/Old/a.txt", "Assets/Old/b.txt"])
         done = self.commit("feat: MPS-16 cleanup", "Assets/Old/a.txt", "Assets/Old/b.txt")
         self.assertEqual(sorted(done["files"]), ["D\tAssets/Old/a.txt", "D\tAssets/Old/b.txt"])
+
+    # -- round 3 -----------------------------------------------------------
+
+    def test_edit_between_bundle_and_classify_is_stale(self):
+        """M1: the approval is bound to what the reviewer saw, not to the state at classify time."""
+        self.prepare("feature/MPS-17-a", "MPS-17")
+        self.write("a.txt", "reviewed\n")
+        bundle_id = self.make_bundle()
+        self.write("a.txt", "reviewed\nplus an unreviewed line\n")
+        stale = self.classify(self.write_reply(bundle_id, ["a.txt"]))
+        self.assertEqual((stale["error"], stale["reason"]), ("review_stale", "files_changed"))
+        self.write("new.txt", "appeared after the bundle\n")
+        self.assertEqual(self.classify(self.write_reply(bundle_id, ["a.txt"]))["reason"], "files_changed")
+        self.assertEqual(self.commit("feat: MPS-17 a", "a.txt")["error"], "scope_review_required")
+
+    def test_old_or_incomplete_reviews_never_approve(self):
+        """M2: reused reply, reply without BUNDLE, reply without VERDICT, include on an incomplete scope."""
+        self.prepare("feature/MPS-18-a", "MPS-18")
+        self.write("a.txt", "a\n")
+        old_bundle = self.make_bundle()
+        old_reply = self.write_reply(old_bundle, ["a.txt"], name="old")
+        self.write("b.txt", "b\n")
+        new_bundle = self.make_bundle()
+        reused = self.classify(old_reply)
+        self.assertEqual((reused["error"], reused["reason"]), ("review_stale", "reply_for_other_bundle"))
+        no_id = self.classify(self.write_reply(None, ["a.txt", "b.txt"]))
+        self.assertEqual((no_id["error"], no_id["reason"]), ("review_stale", "reply_without_bundle_id"))
+        no_verdict = self.classify(self.write_reply(new_bundle, ["a.txt", "b.txt"], verdict=None))
+        self.assertFalse(no_verdict["complete"])
+        self.assertEqual(self.commit("feat: MPS-18 a", "a.txt")["error"], "scope_incomplete")
+        partial = self.classify(self.write_reply(new_bundle, ["a.txt"]))  # b.txt not classified
+        self.assertFalse(partial["complete"])
+        forced = self.mps("git", "commit", "--message=feat: MPS-18 a", "--files", "a.txt", "b.txt",
+                          "--include-out-of-scope", "b.txt")
+        self.assertEqual(forced["error"], "scope_incomplete")
+        self.assertTrue(self.classify(self.write_reply(new_bundle, ["a.txt"], out_of_scope=["b.txt"]))["complete"])
+        self.assertTrue(self.commit("feat: MPS-18 a", "a.txt")["ok"])
+
+    def test_squash_merged_branch_is_not_unpushed_work(self):
+        """M3: after squash-merge + branch deletion + prune, the old ticket's commits are not 'unpushed'."""
+        self.prepare("feature/MPS-19-a", "MPS-19")
+        self.write("a.txt", "a\n")
+        self.approve(["a.txt"])
+        self.commit("feat: MPS-19 a", "a.txt")
+        pushed = self.mps("git", "push", "--branch=feature/MPS-19-a", "--base=develop")
+        self.assertEqual(mps.last_pushed_commit(self.repo, "feature/MPS-19-a"), pushed["pushed_commit"])
+        # A maintainer squash-merges on GitLab, which then deletes the source branch.
+        self.push_upstream("develop", "a.txt", "a\n", "MPS-19 a (squashed)")
+        self.git("push", "-q", "origin", "--delete", "feature/MPS-19-a", cwd=self.other)
+        self.git("fetch", "-q", "--prune")
+        self.assertFalse(mps.ref_exists(self.repo, "refs/remotes/origin/feature/MPS-19-a"))
+        self.assertEqual(mps.unpushed_commit_count(self.repo), 0)
+        self.assertEqual(mps.work_in_progress(self.repo, mps.DEFAULT_GENERATED_PATTERNS), (False, []))
+        preflight = self.mps("git", "preflight", "--base=develop", "--branch=feature/MPS-20-b")
+        self.assertNotIn("local_commits_not_carried", [w["code"] for w in preflight["warnings"]])
+        nxt = self.prepare("feature/MPS-20-b", "MPS-20")
+        self.assertEqual((nxt["action"], nxt["commits_left_behind"]), ("created_from_base", 0))
+        # Without the record the same commit would count as unpushed (the regression this guards against).
+        self.git("config", "--unset", "branch.feature/MPS-19-a.mps-pushed")
+        self.git("switch", "-q", "feature/MPS-19-a")
+        self.assertEqual(mps.unpushed_commit_count(self.repo), 1)
+
+    def test_resume_commit_with_leftover_files(self):
+        """m2: re-running the same commit after success is nothing_to_commit, even with other files still changed."""
+        self.prepare("feature/MPS-21-a", "MPS-21")
+        self.write("a.txt", "a\n")
+        self.write("left.txt", "not for this ticket\n")
+        self.approve(["a.txt"], out_of_scope=["left.txt"])
+        self.assertEqual(self.commit("feat: MPS-21 a", "a.txt")["left_uncommitted"], ["left.txt"])
+        again = self.commit("feat: MPS-21 a", "a.txt")
+        self.assertEqual((again["error"], again["already_committed"]), ("nothing_to_commit", ["a.txt"]))
+        self.assertEqual(self.commit("feat: MPS-21 a", "a.txt", "typo.txt")["error"], "explicit_files_required")
+
+    def test_inferred_base_tie_is_ambiguous(self):
+        """m3: develop and master on the same commit: only develop may be inferred."""
+        self.git("push", "-q", "origin", "develop:master")
+        self.git("fetch", "-q")
+        self.prepare("feature/MPS-22-a", "MPS-22")
+        self.write("a.txt", "a\n")
+        self.approve(["a.txt"])
+        self.commit("feat: MPS-22 a", "a.txt")
+        self.git("config", "--unset", "branch.feature/MPS-22-a.mps-base")
+        with self.assertRaises(mps.MpsError) as ctx:
+            mps.ensure_mr_target(self.repo, "feature/MPS-22-a", "master", "MPS-22", BRANCHES)
+        self.assertEqual((ctx.exception.code, ctx.exception.extra["inferred_bases"]),
+                         ("target_ambiguous", ["develop", "master"]))
+        self.assertIsNone(mps.ensure_mr_target(self.repo, "feature/MPS-22-a", "develop", "MPS-22", BRANCHES))
+
+    # -- generated files and phase pinning ----------------------------------
+
+    def test_generated_files_do_not_pin_the_phase(self):
+        self.git("switch", "-q", "release/1.0")
+        self.write("ProjectSettings/ProjectSettings.asset", "unity rewrote this\n")
+        self.write("Game.csproj", "<Project/>\n")
+        plan = self.plan("--type=bug", "--key=MPS-30", "--phase=dev")
+        self.assertEqual((plan["phase"], plan["phase_source"], plan["work_in_progress"]),
+                         ("dev", "requested_clean_tree", False))
+        self.assertEqual(sorted(plan["generated_changes"]), ["Game.csproj", "ProjectSettings/ProjectSettings.asset"])
+        required = self.plan("--type=bug", "--key=MPS-30")
+        self.assertEqual((required["error"], len(required["generated_changes"])), ("phase_required", 2))
+        # A real source change on the release branch does pin it.
+        self.write("src/fix.cs", "class Fix {}\n")
+        conflict = self.plan("--type=bug", "--key=MPS-30", "--phase=dev")
+        self.assertEqual(conflict["error"], "phase_conflict")
+        self.assertEqual(len(conflict["generated_changes"]), 2)
+        # Committing is unaffected: the generated files are still offered to the scope review.
+        uncommitted, _ = mps.review_candidates(self.repo, "origin/release/1.0")
+        self.assertIn("ProjectSettings/ProjectSettings.asset", uncommitted)
+
+    def test_generated_patterns_from_env(self):
+        self.write(".env", "MPS_GENERATED_PATTERNS=Assets/Gen/**\n")  # untracked .env never counts as work
+        self.git("switch", "-q", "release/1.0")
+        self.write("Assets/Gen/Bindings.cs", "// generated\n")
+        plan = self.plan("--type=bug", "--key=MPS-31", "--phase=dev")
+        self.assertEqual((plan["phase_source"], plan["generated_changes"]),
+                         ("requested_clean_tree", ["Assets/Gen/Bindings.cs"]))
+        self.assertEqual(self.mps("env", "set", "MPS_GENERATED_PATTERNS", "Assets/Gen/**,*.lock")["key"],
+                         "MPS_GENERATED_PATTERNS")
 
 
 if __name__ == "__main__":

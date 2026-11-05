@@ -34,6 +34,7 @@ import socket  # noqa: E402
 import ssl  # noqa: E402
 import subprocess  # noqa: E402
 import unicodedata  # noqa: E402
+import uuid  # noqa: E402
 import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
@@ -63,12 +64,19 @@ KEY_BRANCH_DEV = "MPS_BRANCH_DEV"
 KEY_BRANCH_BETA_PREFIX = "MPS_BRANCH_BETA_PREFIX"
 KEY_BRANCH_PROD = "MPS_BRANCH_PROD"
 KEY_CA_BUNDLE = "MPS_CA_BUNDLE"
+KEY_GENERATED_PATTERNS = "MPS_GENERATED_PATTERNS"
 
 KNOWN_KEYS = (
     KEY_JIRA_URL, KEY_JIRA_PAT, KEY_JIRA_PROJECT,
     KEY_GITLAB_URL, KEY_GITLAB_PAT, KEY_GITLAB_PROJECT,
     KEY_BRANCH_DEV, KEY_BRANCH_BETA_PREFIX, KEY_BRANCH_PROD,
-    KEY_CA_BUNDLE,
+    KEY_CA_BUNDLE, KEY_GENERATED_PATTERNS,
+)
+
+# Files Unity (or the IDE) rewrites on its own. They never make the current branch "hold work" for phase
+# pinning; they are still classified by the scope review and never auto-committed.
+DEFAULT_GENERATED_PATTERNS = (
+    "ProjectSettings/**", "Packages/packages-lock.json", "UserSettings/**", "*.csproj", "*.sln", "Library/**",
 )
 REQUIRED_CONNECTION_KEYS = (KEY_JIRA_URL, KEY_JIRA_PAT, KEY_GITLAB_URL, KEY_GITLAB_PAT)
 DEFAULTS = {
@@ -96,6 +104,8 @@ FOREIGN_COMMITS_REPORTED = 10
 TMP_DIRNAME = "mps-tmp"
 BASE_CONFIG_NAME = "mps-base"
 SCOPE_FILENAME = "scope.json"
+BUNDLE_META_FILENAME = "bundle.json"
+PUSHED_CONFIG_NAME = "mps-pushed"
 STASH_MESSAGE = "mps-auto"
 REVIEW_BUNDLE_FILENAME = "mps-review.md"
 MIN_REDACT_LEN = 4
@@ -574,6 +584,52 @@ def scan_secrets(diff_text):
     return findings
 
 
+def generated_patterns(extra):
+    """Default generated-file globs plus the comma-separated MPS_GENERATED_PATTERNS value."""
+    added = [p.strip().replace("\\", "/") for p in (extra or "").split(",") if p.strip()]
+    return list(DEFAULT_GENERATED_PATTERNS) + [p for p in added if p not in DEFAULT_GENERATED_PATTERNS]
+
+
+def _glob_regex(pattern):
+    """'**' = any characters (also '/'), '*' = any characters except '/', '?' = one character except '/'."""
+    parts = []
+    index = 0
+    while index < len(pattern):
+        if pattern.startswith("**", index):
+            parts.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            parts.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            parts.append("[^/]")
+            index += 1
+        else:
+            parts.append(re.escape(pattern[index]))
+            index += 1
+    return re.compile("^" + "".join(parts) + "$")
+
+
+def is_generated_path(path, patterns):
+    """True if `path` matches a generated-file glob.
+
+    A pattern without '/' (e.g. '*.csproj') matches the file name anywhere; a pattern with '/' matches from the repo
+    root or from any folder inside it, so a Unity project in a sub-folder ('Game/ProjectSettings/x.asset') counts.
+    """
+    normalized = (path or "").replace("\\", "/").strip("/")
+    segments = normalized.split("/")
+    for pattern in patterns:
+        glob = pattern.replace("\\", "/").strip("/")
+        regex = _glob_regex(glob)
+        if "/" not in glob:
+            if regex.match(segments[-1]):
+                return True
+            continue
+        if any(regex.match("/".join(segments[start:])) for start in range(len(segments))):
+            return True
+    return False
+
+
 def is_env_file(path):
     name = os.path.basename((path or "").replace("\\", "/").rstrip("/"))
     if name == ".env.example":
@@ -768,11 +824,15 @@ COMMITTABLE_CATEGORIES = ("in_scope", "concern")
 _REVIEW_FILES_HEADER_RE = re.compile(r"^\s*FILES:\s*$")
 _REVIEW_FILE_LINE_RE = re.compile(r"^\s*[-*]?\s*(in_scope|out_of_scope|mixed|concern)\s*:\s*(.+?)\s*$")
 _REVIEW_VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(PASS|FAIL)\s*$", re.MULTILINE)
+_REVIEW_BUNDLE_RE = re.compile(r"^\s*BUNDLE:\s*`?([0-9a-fA-F]+)`?\s*$", re.MULTILINE)
 _TRAILING_NOTE_RE = re.compile(r"\s+\(.*\)$")
 
 
 def parse_review_files(text):
-    """Reviewer reply -> ([(category, raw_path)], verdict or None). Reads the lines after the `FILES:` header."""
+    """Reviewer reply -> ([(category, raw_path)], verdict or None, bundle id or None).
+
+    Reads the lines after the `FILES:` header; the `BUNDLE:` line ties the reply to the bundle that was reviewed.
+    """
     entries = []
     in_block = False
     for line in (text or "").splitlines():
@@ -785,7 +845,29 @@ def parse_review_files(text):
         if match:
             entries.append((match.group(1), match.group(2).strip("`")))
     verdicts = _REVIEW_VERDICT_RE.findall(text or "")
-    return entries, (verdicts[-1] if verdicts else None)
+    bundles = _REVIEW_BUNDLE_RE.findall(text or "")
+    return entries, (verdicts[-1] if verdicts else None), (bundles[-1].lower() if bundles else None)
+
+
+def stale_bundle_reason(bundle, reply_bundle_id, base, branch, head, current_blobs):
+    """Why a review reply cannot be trusted for the current work tree (None = it can).
+
+    The reply must name the bundle it reviewed, and nothing may have moved since that bundle was made: same base,
+    branch and HEAD, the same set of changed files with the same content.
+    """
+    if bundle is None:
+        return "no_bundle"
+    if not reply_bundle_id:
+        return "reply_without_bundle_id"
+    if reply_bundle_id != bundle.get("bundle_id"):
+        return "reply_for_other_bundle"
+    if bundle.get("base") != base:
+        return "base_changed"
+    if bundle.get("branch") != branch or bundle.get("head") != head:
+        return "branch_or_commit_changed"
+    if (bundle.get("blobs") or {}) != current_blobs:
+        return "files_changed"
+    return None
 
 
 def _match_candidate(raw, candidates):
@@ -1415,11 +1497,17 @@ def unstage(root, paths):
 
 
 def unpushed_commit_count(root):
-    """Commits reachable from HEAD that are on no origin branch (0 before the first commit)."""
+    """Commits reachable from HEAD that are on no origin branch and were never pushed by this skill.
+
+    After a squash-merge GitLab deletes the ticket branch and `fetch --prune` drops origin/<branch>; its commits
+    are then on no remote ref although they were pushed. The last pushed commit recorded per branch
+    (`branch.<name>.mps-pushed`) keeps them from counting as unpushed work. 0 before the first commit.
+    """
     if not head_exists(root):
         return 0
-    output = run_git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], root).stdout.strip()
-    return int(output or 0)
+    pushed = last_pushed_commit(root, current_branch(root))
+    args = ["rev-list", "--count", "HEAD", "--not", "--remotes=origin"] + ([pushed] if pushed else [])
+    return int(run_git(args, root).stdout.strip() or 0)
 
 
 def git_identity(root):
@@ -1497,6 +1585,19 @@ def closest_bases(counts):
     return sorted(name for name, count in counts.items() if count == fewest)
 
 
+def inferred_target_verdict(target, inferred, dev_branch):
+    """"ok", "mismatch" (target is not a closest base) or "ambiguous" (a tie, and the target is not the dev branch).
+
+    A tie happens when e.g. master and a release branch point at the same commit; only develop - the safe, normal
+    target - is accepted then.
+    """
+    if target not in inferred:
+        return "mismatch"
+    if len(inferred) > 1 and target != dev_branch:
+        return "ambiguous"
+    return "ok"
+
+
 def origin_base_candidates(root, branches):
     names = [branches["dev"], branches["prod"]]
     output = run_git(["for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin/" + branches["beta_prefix"]],
@@ -1535,10 +1636,17 @@ def ensure_mr_target(root, source, target, key, branches):
             log_range = "refs/remotes/origin/%s..%s" % (name, source_ref)
             counts[name] = int(run_git(["rev-list", "--count", log_range], root).stdout.strip() or 0)
         inferred = closest_bases(counts)
-        if target not in inferred:
+        verdict = inferred_target_verdict(target, inferred, branches["dev"])
+        if verdict == "mismatch":
             raise MpsError("target_mismatch_inferred_base",
                            "Nhánh %s có vẻ được tạo từ %s, không phải %s. Merge request phải vào đúng nhánh gốc — hãy "
                            "nhờ developer kiểm tra." % (source, " / ".join(inferred), target),
+                           source=source, target=target, inferred_bases=inferred, commit_counts=counts)
+        if verdict == "ambiguous":
+            raise MpsError("target_ambiguous",
+                           "Không xác định chắc nhánh %s được tạo từ đâu (%s đều có thể). Chỉ cho phép tự động khi "
+                           "đích là %s; với %s hãy nhờ developer kiểm tra." % (
+                               source, " / ".join(inferred), branches["dev"], target),
                            source=source, target=target, inferred_bases=inferred, commit_counts=counts)
     ensure_branch_matches_base(root, target, source_ref, source, key)
     return recorded
@@ -1564,19 +1672,46 @@ def scope_path(root):
     return os.path.join(mps_tmp_dir(root), SCOPE_FILENAME)
 
 
-def load_scope(root, branch):
-    """The decisions of the last `review classify`, valid only for the same branch and HEAD."""
-    path = scope_path(root)
+def bundle_meta_path(root):
+    return os.path.join(mps_tmp_dir(root), BUNDLE_META_FILENAME)
+
+
+def _read_json(path):
     if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as handle:
+        return json.loads(handle.read().decode("utf-8"))
+
+
+def load_scope(root, branch):
+    """The decisions of the last `review classify`: valid only if complete and for the same branch and HEAD."""
+    scope = _read_json(scope_path(root))
+    if scope is None:
         raise MpsError("scope_review_required", "Chưa có kết quả review phạm vi cho các thay đổi hiện tại. Hãy chạy "
                                                 "review phạm vi (bước 6) trước khi commit.")
-    with open(path, "rb") as handle:
-        scope = json.loads(handle.read().decode("utf-8"))
     if scope.get("branch") != branch or scope.get("head") != head_sha(root):
         raise MpsError("scope_review_required", "Kết quả review phạm vi đã cũ (nhánh hoặc commit đã thay đổi từ lúc "
                                                 "review). Hãy review lại.",
                        reviewed_branch=scope.get("branch"), current_branch=branch)
+    if not scope.get("complete"):
+        raise MpsError("scope_incomplete", "Kết quả review phạm vi chưa đầy đủ (thiếu file, thiếu VERDICT hoặc có đường "
+                                           "dẫn lạ). Hãy yêu cầu reviewer trả lời lại cho đủ rồi chạy review classify.",
+                       unclassified_files=scope.get("unclassified_files"))
     return scope
+
+
+def pushed_config_key(branch):
+    return "branch.%s.%s" % (branch, PUSHED_CONFIG_NAME)
+
+
+def last_pushed_commit(root, branch):
+    """Commit this skill last pushed for `branch` (kept after GitLab deletes the merged branch), or None."""
+    if not branch:
+        return None
+    sha = run_git(["config", "--local", "--get", pushed_config_key(branch)], root, check=False).stdout.strip()
+    if sha and run_git(["rev-parse", "-q", "--verify", sha + "^{commit}"], root, check=False).ok:
+        return sha
+    return None
 
 
 def check_against_scope(scope, requested, current_blobs, include_out_of_scope):
@@ -2058,10 +2193,17 @@ def branch_context(root, branches, key=None):
                                  detached_at=detached_at)
 
 
-def has_work_in_progress(root):
-    """Uncommitted changes (except .env files) or commits not on any origin branch."""
+def work_in_progress(root, patterns):
+    """(dirty, generated_changes) for phase pinning only.
+
+    Dirty = real uncommitted changes or commits on no origin branch. `.env` files and tool-generated files
+    (`patterns`, e.g. Unity's ProjectSettings) do not count; the generated ones are returned so the agent can
+    mention them. Committing is not affected: those files still go through the scope review.
+    """
     changed = [p for p in _changed_paths(git_status(root)) if not is_env_file(p)]
-    return bool(changed) or unpushed_commit_count(root) > 0
+    generated = [p for p in changed if is_generated_path(p, patterns)]
+    real = [p for p in changed if p not in generated]
+    return bool(real) or unpushed_commit_count(root) > 0, generated
 
 
 def cmd_flow_plan(args):
@@ -2074,8 +2216,12 @@ def cmd_flow_plan(args):
     if not fetched.ok:
         raise_git_network_error(fetched, "fetch")
     context = branch_context(root, branches, key)
-    dirty = has_work_in_progress(root)
-    phase, phase_source, pinned = reconcile_phase(context, args.phase, dirty)
+    dirty, generated = work_in_progress(root, generated_patterns(cfg.get(KEY_GENERATED_PATTERNS)))
+    try:
+        phase, phase_source, pinned = reconcile_phase(context, args.phase, dirty)
+    except MpsError as exc:
+        exc.extra.setdefault("generated_changes", generated)  # so the agent can still mention them
+        raise
     plan = plan_phase(phase, args.type, branches)
     warnings = []
     if context["recorded_base_gone"]:
@@ -2122,7 +2268,7 @@ def cmd_flow_plan(args):
     plan.pop("needs_release_lookup", None)
     plan.update(context)
     plan.update({"phase_source": phase_source, "pinned_by_current_branch": pinned, "work_in_progress": dirty,
-                 "warnings": warnings})
+                 "generated_changes": generated, "warnings": warnings})
     return plan
 
 
@@ -2227,14 +2373,15 @@ def cmd_git_preflight(args):
     unpushed = unpushed_commit_count(root)
     if unpushed and branch and is_protected_branch(branch, branches):
         blockers.append({"code": "commits_on_protected_branch", "count": unpushed,
-                         "message": "Có %d commit tạo thẳng trên nhánh %s mà chưa đẩy lên. Không được đẩy thẳng "
-                                    "vào nhánh này — cần developer giúp chuyển chúng sang nhánh riêng." % (
+                         "message": "Có %d commit tạo thẳng trên nhánh %s và không có trên GitLab. Không được đẩy "
+                                    "thẳng vào nhánh này — cần developer giúp chuyển chúng sang nhánh riêng." % (
                                         unpushed, branch)})
     elif unpushed and branch != args.branch:
         warnings.append({"code": "local_commits_not_carried", "count": unpushed, "branch": branch,
-                         "message": "Nhánh hiện tại (%s) có %d commit chưa đẩy lên GitLab. Nhánh mới của ticket sẽ được "
-                                    "tạo từ code mới nhất trên GitLab nên KHÔNG mang theo các commit này. Hãy hỏi "
-                                    "developer, hoặc xác nhận là bỏ chúng lại." % (branch or "HEAD", unpushed)})
+                         "message": "Nhánh hiện tại (%s) có %d commit không nằm trên nhánh nào của GitLab (thường là "
+                                    "commit chưa được đẩy lên). Nhánh mới của ticket sẽ được tạo từ code mới nhất trên "
+                                    "GitLab nên KHÔNG mang theo các commit này. Hãy hỏi developer, hoặc xác nhận là bỏ "
+                                    "chúng lại." % (branch or "HEAD", unpushed)})
 
     upstream = None
     ahead = behind = None
@@ -2360,7 +2507,8 @@ def _create_from_base(root, args):
     left_behind = unpushed_commit_count(root)
     if left_behind and not args.leave_commits:
         raise MpsError("local_commits_not_carried",
-                       "Nhánh hiện tại có %d commit chưa đẩy lên GitLab. Nhánh mới sẽ được tạo từ origin/%s nên "
+                       "Nhánh hiện tại có %d commit không nằm trên nhánh nào của GitLab (thường là commit chưa được "
+                       "đẩy lên). Nhánh mới sẽ được tạo từ origin/%s nên "
                        "KHÔNG mang theo các commit này (chúng vẫn nằm nguyên ở nhánh cũ). Hãy hỏi developer; chỉ "
                        "chạy lại với --leave-commits khi người dùng xác nhận bỏ chúng lại." % (left_behind, args.base),
                        count=left_behind, current_branch=current_branch(root))
@@ -2410,8 +2558,14 @@ def cmd_git_diff_for_review(args):
                  for i, path in enumerate(untracked_paths)]
     hidden = _hidden_env_paths(root, base_ref, untracked_paths)
     to_classify, already_committed = review_candidates(root, base_ref)
+    # Snapshot of exactly what the reviewer is shown; `review classify` refuses replies for any other state.
+    snapshot = {"bundle_id": uuid.uuid4().hex, "base": args.base, "branch": current_branch(root),
+                "head": head_sha(root), "blobs": file_blobs(root, to_classify)}
+    with open(bundle_meta_path(root), "wb") as handle:
+        handle.write(json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8"))
     result = {
         "base": args.base,
+        "bundle_id": snapshot["bundle_id"],
         "files_to_classify": to_classify,
         "already_committed_files": already_committed,
         "committed_files": _name_status(root, [base_ref + "...HEAD"]) if head_exists(root) else [],
@@ -2424,7 +2578,7 @@ def cmd_git_diff_for_review(args):
     if args.to_file:
         path = os.path.join(git_dir(root), REVIEW_BUNDLE_FILENAME)
         bundle = _render_review_bundle(args.base, budgeted[0][0], budgeted[1][0], untracked, hidden, truncated,
-                                       to_classify + already_committed)
+                                       to_classify + already_committed, snapshot["bundle_id"])
         with open(path, "wb") as handle:
             handle.write(bundle.encode("utf-8"))
         result["bundle_path"] = path
@@ -2467,8 +2621,9 @@ def _hidden_env_paths(root, base_ref, untracked_paths):
     return sorted(set(p for p in paths if is_env_file(p)))
 
 
-def _render_review_bundle(base, committed, working, untracked, hidden, truncated, files_to_classify):
+def _render_review_bundle(base, committed, working, untracked, hidden, truncated, files_to_classify, bundle_id):
     parts = ["# Change bundle for scope review", "",
+             "Bundle-ID: %s" % bundle_id, "(copy it into your reply as the line `BUNDLE: %s`)" % bundle_id, "",
              "Base: origin/%s. Truncated: %s." % (base, "YES (review what is shown, say so in the verdict)"
                                                    if truncated else "no"), "",
              "## 0. Files to classify (each must appear exactly once in your FILES: block)", ""]
@@ -2524,10 +2679,16 @@ def cmd_git_commit(args):
     changed = _changed_paths(status)
     if not changed:
         raise MpsError("nothing_to_commit", "Không có thay đổi nào để commit.")
-    # Only exact changed paths are accepted: a folder (even a deleted one), '.' or a typo would sweep in or miss
-    # changes (Unity-regenerated .meta/ProjectSettings, lock files, someone else's edits).
     sources = set(status["renames"].values())
     exact = set(changed) | set(status["renames"]) | sources
+    # Resuming after a successful commit (other, excluded files still changed): files already committed on this
+    # ticket branch and untouched since are "nothing to commit", not a wrong path.
+    already = _already_committed(root, branch, [p for p in requested if p not in exact])
+    if already and len(already) == len(requested):
+        raise MpsError("nothing_to_commit", "Các file này đã được commit trên nhánh %s rồi, không có thay đổi mới."
+                       % branch, already_committed=already)
+    # Only exact changed paths are accepted: a folder (even a deleted one), '.' or a typo would sweep in or miss
+    # changes (Unity-regenerated .meta/ProjectSettings, lock files, someone else's edits).
     inexact = [p for p in requested if p not in exact]
     if inexact:
         raise MpsError("explicit_files_required", "Chỉ commit đúng từng file đang thay đổi (như danh sách của git "
@@ -2580,22 +2741,41 @@ def cmd_git_commit(args):
             "left_uncommitted": _changed_paths(git_status(root))}
 
 
+def _already_committed(root, branch, paths):
+    """Of `paths` (unchanged in the work tree), those committed on this ticket branch since its recorded base."""
+    base = recorded_base(root, branch)
+    if not paths or not base or not ref_exists(root, "refs/remotes/origin/" + base) or not head_exists(root):
+        return []
+    on_branch = set(_name_only_z(root, ["origin/%s...HEAD" % base]))
+    return [p for p in paths if p in on_branch]
+
+
 def cmd_review_classify(args):
     """Check the reviewer's FILES: block against the real changes and derive the default commit / exclude lists."""
     root = find_project_root()
     if os.path.isfile(scope_path(root)):
         os.remove(scope_path(root))  # a new review always replaces the previous decisions
     uncommitted, committed = review_candidates(root, "origin/" + args.base)
-    entries, verdict = parse_review_files(read_text_arg(None, args.result_file, "kết quả review"))
+    entries, verdict, reply_bundle_id = parse_review_files(read_text_arg(None, args.result_file, "kết quả review"))
     if not entries:
         raise MpsError("review_unparsable", "Không đọc được khối FILES: trong kết quả review. Hãy yêu cầu reviewer trả "
                                             "lời đúng định dạng rồi chạy lại.", result_file=args.result_file)
+    # The reply must be for the bundle the reviewer actually read, and nothing may have changed since that bundle.
+    bundle = _read_json(bundle_meta_path(root))
+    reason = stale_bundle_reason(bundle, reply_bundle_id, args.base, current_branch(root), head_sha(root),
+                                 file_blobs(root, uncommitted))
+    if reason:
+        raise MpsError("review_stale", "Kết quả review này không khớp với các thay đổi hiện tại (%s). Hãy chạy lại git "
+                                       "diff-for-review và nhờ reviewer review lại bundle mới." % reason, reason=reason)
     result = classify_review(entries, uncommitted, committed, verdict)
-    result.update({"files_to_classify": uncommitted, "already_committed_files": committed})
-    # Persist the decisions: `git commit` only accepts files approved here, unchanged since this moment.
-    scope = {"base": args.base, "branch": current_branch(root), "head": head_sha(root),
-             "blobs": file_blobs(root, uncommitted)}
-    for name in ("commit_files", "excluded_files", "mixed_files", "unclassified_files", "needs_decision", "verdict"):
+    result.update({"bundle_id": bundle["bundle_id"], "files_to_classify": uncommitted,
+                   "already_committed_files": committed})
+    # Persist the decisions with the fingerprints of what the reviewer saw: `git commit` only accepts approved
+    # files whose content is still exactly that, and only from a complete review.
+    scope = {"base": args.base, "branch": bundle["branch"], "head": bundle["head"], "bundle_id": bundle["bundle_id"],
+             "blobs": bundle["blobs"]}
+    for name in ("commit_files", "excluded_files", "mixed_files", "unclassified_files", "needs_decision", "verdict",
+                 "complete"):
         scope[name] = result[name]
     path = scope_path(root)
     with open(path, "wb") as handle:
@@ -2648,7 +2828,10 @@ def cmd_git_push(args):
     pushed, used_token = run_git_network(root, ["push", "--recurse-submodules=no", "-u", "origin", refspec], cfg)
     if not pushed.ok:
         raise_git_network_error(pushed, "push")
-    return {"branch": name, "remote": sanitize_remote_url(origin_url(root)), "used_token_fallback": used_token}
+    pushed_sha = run_git(["rev-parse", "refs/heads/" + name], root).stdout.strip()
+    run_git(["config", "--local", pushed_config_key(name), pushed_sha], root)
+    return {"branch": name, "pushed_commit": pushed_sha, "remote": sanitize_remote_url(origin_url(root)),
+            "used_token_fallback": used_token}
 
 
 # ---------------------------------------------------------------------------
@@ -2673,8 +2856,12 @@ def cmd_mr_ensure(args):
     cfg = load_config(root)
     if args.source == args.target:
         raise MpsError("invalid_mr", "Nhánh nguồn và nhánh đích không được trùng nhau.")
+    branches = cfg.branches()
+    ensure_valid_base(args.target, branches)
+    # The phase rules apply to the target too: no Story into a release branch or master.
+    plan_phase(phase_of_branch(args.target, branches), args.type, branches)
     # Offline guard first: the MR must go back into the branch the work was based on, with only this ticket's commits.
-    ensure_mr_target(root, args.source, args.target, normalize_issue_key(args.key), cfg.branches())
+    ensure_mr_target(root, args.source, args.target, normalize_issue_key(args.key), branches)
     gitlab = gitlab_client(cfg)
     project = resolve_gitlab_project(cfg, gitlab)
     existing = _find_open_mr(gitlab, project["id"], args.source)
@@ -2813,6 +3000,7 @@ def build_parser():
     p.add_argument("--title", required=True)
     p.add_argument("--description", required=True)
     p.add_argument("--key", required=True, help="Jira key; every commit in origin/TARGET..SOURCE must mention it")
+    p.add_argument("--type", required=True, choices=TICKET_TYPES, help="ticket type; checked against the target's phase")
     p.set_defaults(handler=cmd_mr_ensure)
 
     review = _subcommands(groups.add_parser("review", help="scope review result"), "command")
