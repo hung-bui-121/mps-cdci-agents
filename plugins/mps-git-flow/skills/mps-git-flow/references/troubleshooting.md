@@ -15,7 +15,7 @@ Each script failure has an `error` code, a Vietnamese `message` and often `servi
 | `insecure_url` | URL is not https | Fix `MPS_JIRA_URL` / `MPS_GITLAB_URL` to `https://...` |
 | `gitlab_project_unknown` | Origin is not on the MPS GitLab host | Ask for the project path, `env set MPS_GITLAB_PROJECT group/project` |
 | `gitlab_project_not_found` | Wrong path or no access | Check the path in the GitLab web UI; ask a maintainer for access |
-| `jira_project_not_found` | Wrong `MPS_JIRA_PROJECT_KEY` | Pick from `available_projects`, `env set MPS_JIRA_PROJECT_KEY KEY` |
+| `jira_project_not_found` | Wrong `MPS_JIRA_PROJECT_KEY` (the default board for new tickets; it may differ from the GitLab project) | Pick from `available_projects`, `env set MPS_JIRA_PROJECT_KEY KEY` |
 
 `.env` is read only from the project root. Real environment variables are ignored on purpose (one project's
 token is never picked up for another). If `env_tracked` appears in `warnings`, `.env` was committed in the past:
@@ -51,6 +51,24 @@ a developer must remove it from git (`git rm --cached .env`) and the tokens must
 | `env_file` / `secret_detected` (commit, push) | `.env` or a token/private key would be committed or published | Nothing was committed / pushed. Remove the secret; for already-made commits a developer must help |
 | `add_failed` | A path given to `--files` does not exist or is ignored | Use root-relative paths from `git preflight` |
 | `mr_target_mismatch` | An open MR from this branch targets a different branch | Stop; a developer decides (close/retarget the old MR or use another branch) |
+| `base_mismatch` (prepare-branch, push) | The ticket branch was made from `recorded_base` and must merge back into it | Use the recorded base. Moving the work to another branch/phase needs a developer |
+| `target_mismatch_recorded_base` (mr ensure) | MR target differs from the branch's recorded base | Use `--target=<recorded_base>`; otherwise ask a developer |
+| `phase_conflict` (flow plan) | The chosen phase differs from the branch that holds the work (changes / unpushed commits on it, or this ticket's own branch) | Explain: changes go back into the branch they were made on; moving them to another phase needs a developer |
+| `phase_required` (flow plan) | Nothing pins the phase (clean tree, personal branch, another ticket's branch) | Ask the user: dev, beta or production; re-run with `--phase=` |
+| `not_latest_release` (flow plan warning) | The user works on an older `release/*` branch that still exists on GitLab | Allowed (the MR goes into that branch) - confirm with the user that this is intended |
+| `explicit_files_required` (commit) | A folder (even a deleted one), `.` or a path that is not a changed file was passed to `--files` | Pass the individual changed files (`changed_files_inside` lists those under the given path) |
+| `scope_review_required` (commit) | No scope review yet, or the branch / HEAD changed since the review | Run the scope review + `review classify` again (SKILL step 6) |
+| `not_in_scope` (commit) | A requested file is not in the review's `commit_files` (out-of-scope, mixed, needs_decision, unclassified) | Leave it out, or - only if the user named that file - pass it in `--include-out-of-scope` too |
+| `changed_since_review` (commit) | A file was edited (or appeared) after the review | Run the review + `review classify` again |
+| `invalid_include` (commit) | `--include-out-of-scope` names a file that is not in `--files` | List the file in both |
+| `invalid_base` (prepare-branch, push, mr ensure) | Base / target is not develop, master or a release/* branch | Use the base from `flow plan` |
+| `target_mismatch_inferred_base` (mr ensure) | No recorded base; the source branch is closest to another protected branch (`inferred_bases`, `commit_counts`) | Ask a developer which branch it really came from |
+| `base_not_found` (mr ensure) | `origin/<target>` does not exist locally (wrong target or never fetched) | Re-check the plan; run `git prepare-branch` (fetches) |
+| `branch_not_found` (mr ensure) | The source branch is neither local nor on origin | Push the branch first (`git push`) |
+| `release_branch_gone` (flow plan) | The release branch the work sits on was deleted on GitLab | Stop; a developer must move the work |
+| `recorded_base_gone` (flow plan) | The ticket branch's recorded base was deleted on GitLab. Warning on a clean tree (branch not reused); error with work in progress | Error: a developer must move the work |
+| `detached_head` (flow plan) | Changes exist but HEAD is on no branch (and not exactly on develop/master/release/*) | Stop; a developer must help |
+| `review_unparsable` (review classify) | The reviewer reply has no `FILES:` block | Ask the reviewer to answer in the required format, save it again, re-run |
 | `switch_failed` | git refused to switch branches | Changes are untouched; show `stderr`; ask a developer |
 | `base_not_found` | `origin/<base>` does not exist | Wrong base branch name or phase; check with the user/developer |
 | `protected_branch` | Tried to commit/push on develop/master/release/* | Use `git prepare-branch` to move to the ticket branch first |
@@ -72,7 +90,9 @@ error messages can be recognised on Vietnamese-language systems.
 
 | error | Meaning | What to do |
 |---|---|---|
-| `ticket_not_found` | Wrong key or no permission | Re-check the key with the user |
+| `ticket_not_found` | Wrong key or no permission | Re-check the key with the user. Tickets from any board (MPS-…, ART-…) are accepted |
+| `jira_project_not_found` (create `--project`) | The chosen board does not exist or is not visible | Pick from `available_projects` (`jira projects`) |
+| `invalid_project_key` | `--project` / `MPS_JIRA_PROJECT_KEY` is not a project key (e.g. `ART-12` instead of `ART`) | Use the project key only |
 | `unsupported_type` | Ticket is not a Story or Bug | Use/create a Story or Bug ticket |
 | `issue_type_not_found` | The Jira project has no Story/Bug type | Check `available_types`; ask the project admin |
 | `missing_required_fields` | The create screen requires more fields | Ask the user for each field in `fields` (offer `allowed_values`), retry with `--field "<id or name>=<value>"` |
