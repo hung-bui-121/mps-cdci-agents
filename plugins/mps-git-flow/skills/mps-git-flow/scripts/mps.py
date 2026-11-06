@@ -41,7 +41,7 @@ import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 USER_AGENT = "mps-git-flow/" + VERSION
 
 EXIT_FAILURE = 1
@@ -141,6 +141,26 @@ PUSHED_CONFIG_NAME = "mps-pushed"
 STASH_MESSAGE = "mps-auto"
 REVIEW_BUNDLE_FILENAME = "mps-review.md"
 MIN_REDACT_LEN = 4
+
+# Rule-based code review (runs next to the scope review on the same Bundle-ID snapshot).
+CODE_REVIEW_BUNDLE_FILENAME = "mps-code-review.md"
+CODE_REVIEW_FILENAME = "code_review.json"            # pending: written by review findings, consumed by git commit
+COMMITTED_REVIEW_FILENAME = "committed_review.json"  # the review of the last commit, read by mr ensure
+CODE_REVIEW_VERSION = 1
+PROJECT_RULES_PATH = ".mps/review.md"
+REVIEW_RULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "references", "review")
+REVIEW_RULES_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "templates",
+                                          "review.example.md")
+SHIPPED_PROFILES = ("python", "unity-csharp", "web")
+SEVERITIES = ("blocker", "major", "minor")
+RULES_CAP_CHARS = 40 * 1000
+DIFF_LINE_CAP_CHARS = 1000
+PROJECT_RULES_MAX_CHARS = 100 * 1000
+RULE_ID_MAX_LEN = 64
+MR_REVIEW_MAX_ITEMS = 30
+MR_PROBLEMS_SHOWN = 5
+MR_PATHS_SHOWN = 10
+WARNING_ITEMS_SHOWN = 10
 
 ACCESS_LEVEL_MAINTAINER = 40
 ACCESS_LEVEL_NAMES = {
@@ -1260,6 +1280,1039 @@ def classify_review(entries, uncommitted, committed, verdict):
 
 
 # ---------------------------------------------------------------------------
+# Pure helpers: code review rules, diff, findings
+# ---------------------------------------------------------------------------
+#
+# Three rule layers: L1 `references/review/base.md` (team baseline), L2 `references/review/profiles/<name>.md`
+# (per detected stack, anchored to the stack's root folder) and L3 `.mps/review.md` read from origin/<base>. Only
+# L3 may declare `blocker`; shipped layers are lowered to `major`. Rule paths use their own glob dialect
+# (`rule_glob_regex`): a slash-less glob such as `*.cs` matches the file name at any depth, unlike
+# MPS_GENERATED_PATTERNS (`_glob_regex`), where a slash-less pattern only matches directly inside its roots.
+
+SEVERITY_RANK = {"blocker": 0, "major": 1, "minor": 2}
+_FM_FENCE_RE = re.compile(r"^---[ \t]*$")
+_FM_PAIR_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:[ \t]*(.*?)[ \t]*$")
+_FM_COMMENT_RE = re.compile(r"^\s*#")
+_MD_H2_RE = re.compile(r"^##(?!#)[ \t]+(.*?)[ \t]*$")
+_RULE_HEADING_RE = re.compile(r"^(\S+)[ \t]+\[([^\]]*)\][ \t]+(\S.*?)$")
+_PATHS_LINE_RE = re.compile(r"^paths[ \t]*:[ \t]*(.*?)[ \t]*$", re.IGNORECASE)
+_CODE_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# Every '-' is followed by a letter, so no part of an id can look like a Jira key (ABC-12) in MR text.
+_RULE_ID_RE = re.compile(r"^[A-Z][A-Z0-9]*(?:-[A-Z][A-Z0-9]*)*$")
+_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+_LIST_QUOTES = "'\"`"
+_RULE_GLOB_CACHE = {}
+
+
+def _rule_problem(parsed, line, message):
+    parsed["problems"].append({"line": line, "message": message})
+
+
+def _rule_list_items(value):
+    """'[a, "b"]' or 'a, b' -> ['a', 'b']; quotes (' " `) around an item are dropped, empty items skipped."""
+    text = value.strip()
+    if len(text) >= 2 and text[0] == "[" and text[-1] == "]":
+        text = text[1:-1]
+    items = []
+    for raw in text.split(","):
+        item = raw.strip()
+        if len(item) >= 2 and item[0] == item[-1] and item[0] in _LIST_QUOTES:
+            item = item[1:-1].strip()
+        if item:
+            items.append(item)
+    return items
+
+
+def normalize_rule_glob(glob):
+    """Rule glob -> normalized form ('\\' -> '/', no leading './' or '/', 'dir/' -> 'dir/**'). ValueError if invalid."""
+    text = (glob or "").replace("\\", "/").strip().strip("`").strip()
+    if text.startswith("./"):
+        text = text[2:]
+    text = text.lstrip("/")
+    if text.endswith("/"):
+        text += "**"
+    if not text or "\0" in text or any(seg in ("", ".", "..") for seg in text.split("/")):
+        raise ValueError("invalid rule glob: %r" % glob)
+    return text
+
+
+def _rule_segment_regex(segment):
+    parts = []
+    index = 0
+    while index < len(segment):
+        if segment.startswith("**", index):
+            parts.append("[^/]*")
+            index += 2
+        elif segment[index] == "*":
+            parts.append("[^/]*")
+            index += 1
+        elif segment[index] == "?":
+            parts.append("[^/]")
+            index += 1
+        else:
+            parts.append(re.escape(segment[index]))
+            index += 1
+    return "".join(parts)
+
+
+def rule_glob_regex(glob):
+    """Compiled regex for a rule glob, matched against a path relative to the rule's root.
+
+    A glob without '/' matches the file name at any depth ('*.cs' == '**/*.cs'). A '**' segment matches zero or
+    more folders when it is not last, and one or more path segments when it is last ('Assets/**' matches
+    everything under Assets/, not a file named Assets). Case-sensitive, like git paths.
+    """
+    normalized = normalize_rule_glob(glob)
+    cached = _RULE_GLOB_CACHE.get(normalized)
+    if cached is None:
+        segments = normalized.split("/")
+        if len(segments) == 1:
+            segments = ["**"] + segments
+        parts = []
+        for index, segment in enumerate(segments):
+            last = index == len(segments) - 1
+            if segment == "**":
+                parts.append(".+" if last else "(?:[^/]+/)*")
+            else:
+                parts.append(_rule_segment_regex(segment) + ("" if last else "/"))
+        cached = re.compile("^" + "".join(parts) + "$")
+        _RULE_GLOB_CACHE[normalized] = cached
+    return cached
+
+
+def path_matches(path, globs, roots):
+    """True if `path`, taken relative to one of `roots` ("" = repo root), matches one of `globs`."""
+    normalized = (path or "").replace("\\", "/").strip("/")
+    for root in roots:
+        relative = _relative_to(normalized, (root or "").replace("\\", "/").strip("/"))
+        if relative is None:
+            continue
+        for glob in globs:
+            if rule_glob_regex(glob).match(relative):
+                return True
+    return False
+
+
+def rule_applies(rule, path):
+    return path_matches(path, rule["paths"], rule["roots"])
+
+
+def parse_rule_file(text, layer):
+    """Parse a rule file. layer: "base" | "profile:<name>" | "project". Returns
+    {version, extends, ignore, unknown_keys, rules, problems: [{line, message}], downgraded}.
+
+    In shipped layers a `blocker` rule is stored as `major` (and listed in `downgraded`). Problems never raise here:
+    the caller decides (a shipped file with problems is a plugin bug; a project file with problems is skipped).
+    """
+    parsed = {"version": 1, "extends": [], "ignore": [], "unknown_keys": [], "rules": [], "problems": [],
+              "downgraded": []}
+    text = text or ""
+    if text.startswith(_BOM):
+        text = text[len(_BOM):]
+    if layer == "project" and len(text) > PROJECT_RULES_MAX_CHARS:
+        _rule_problem(parsed, 1, "File dài quá %d ký tự nên không được đọc. Hãy rút gọn file."
+                      % PROJECT_RULES_MAX_CHARS)
+        return parsed
+    # Split on "\n" only: str.splitlines() also splits on other characters and would shift line numbers.
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    start = 0
+    if _FM_FENCE_RE.match(lines[0]):
+        close = None
+        for index in range(1, len(lines)):
+            if _FM_FENCE_RE.match(lines[index]):
+                close = index
+                break
+        if close is None:
+            _rule_problem(parsed, 1, "Thiếu dòng --- đóng phần đầu file (mở ở dòng 1).")
+            return parsed
+        _parse_rule_frontmatter(lines, close, parsed, layer)
+        start = close + 1
+    _parse_rule_body(lines, start, parsed, layer)
+    return parsed
+
+
+def _parse_rule_frontmatter(lines, close, parsed, layer):
+    seen = set()
+    for index in range(1, close):
+        line = lines[index]
+        number = index + 1
+        if not line.strip() or _FM_COMMENT_RE.match(line):
+            continue
+        match = _FM_PAIR_RE.match(line.strip())
+        if not match:
+            _rule_problem(parsed, number, "Dòng này trong phần đầu file không đúng dạng 'khoá: giá trị'.")
+            continue
+        key = match.group(1).lower()
+        value = _INLINE_COMMENT_RE.split(match.group(2), 1)[0].strip()
+        if key in seen:
+            _rule_problem(parsed, number, "Khoá '%s' bị lặp trong phần đầu file." % key)
+            continue
+        seen.add(key)
+        if key == "version":
+            items = _rule_list_items(value)
+            if items != ["1"]:
+                _rule_problem(parsed, number, "Phiên bản '%s' không được hỗ trợ (chỉ có version: 1)." % value)
+        elif key == "extends":
+            if layer != "project":
+                _rule_problem(parsed, number, "Khoá extends chỉ dùng được trong .mps/review.md.")
+            for item in _rule_list_items(value):
+                if not _PROFILE_NAME_RE.match(item):
+                    _rule_problem(parsed, number, "Tên bộ quy tắc '%s' trong extends không hợp lệ (chỉ chữ thường, "
+                                                  "số và dấu '-', ví dụ unity-csharp)." % item)
+                elif item not in parsed["extends"]:
+                    parsed["extends"].append(item)
+        elif key == "ignore":
+            for item in _rule_list_items(value):
+                try:
+                    parsed["ignore"].append(normalize_rule_glob(item))
+                except ValueError:
+                    _rule_problem(parsed, number, "Mẫu đường dẫn '%s' không hợp lệ." % item)
+        elif key not in parsed["unknown_keys"]:
+            parsed["unknown_keys"].append(key)
+
+
+def _parse_rule_body(lines, start, parsed, layer):
+    fence = None  # (character, length, line number) of the open code fence
+    current = None
+    seen = {}
+    for index in range(start, len(lines)):
+        line = lines[index]
+        number = index + 1
+        if fence is not None:
+            closing = _CODE_FENCE_RE.match(line)
+            if (closing and closing.group(1)[0] == fence[0] and len(closing.group(1)) >= fence[1]
+                    and not line[closing.end():].strip()):
+                fence = None
+            _rule_body_line(current, line, number, False, parsed)
+            continue
+        opening = _CODE_FENCE_RE.match(line)
+        if opening:
+            fence = (opening.group(1)[0], len(opening.group(1)), number)
+            _rule_body_line(current, line, number, False, parsed)
+            continue
+        heading = _MD_H2_RE.match(line)
+        if heading:
+            _finish_rule(current, parsed, layer)
+            current = _start_rule(heading.group(1), number, parsed, seen)
+            continue
+        _rule_body_line(current, line, number, True, parsed)
+    _finish_rule(current, parsed, layer)
+    if fence is not None:
+        _rule_problem(parsed, fence[2], "Khối code (```) mở ở đây nhưng chưa được đóng.")
+
+
+def _start_rule(text, number, parsed, seen):
+    """A level-2 heading always starts a new section (so its body is never glued to the previous rule); a heading
+    with problems produces no rule."""
+    section = {"valid": False, "line": number, "paths": None, "body": [], "started": False}
+    match = _RULE_HEADING_RE.match(text)
+    if not match:
+        _rule_problem(parsed, number, "Tiêu đề quy tắc sai dạng. Đúng: `## MÃ-QUY-TẮC [blocker|major|minor] Tiêu đề`.")
+        return section
+    rule_id, severity, title = match.group(1), match.group(2).strip(), match.group(3).strip()
+    valid = True
+    if not _RULE_ID_RE.match(rule_id) or len(rule_id) > RULE_ID_MAX_LEN:
+        _rule_problem(parsed, number, "Mã quy tắc '%s' không hợp lệ: chỉ dùng chữ IN HOA, số và dấu '-', mỗi phần sau "
+                                      "dấu '-' phải bắt đầu bằng chữ cái (để không giống mã ticket Jira như ABC-12)."
+                      % rule_id)
+        valid = False
+    elif rule_id in seen:
+        _rule_problem(parsed, number, "Mã quy tắc '%s' bị trùng (đã có ở dòng %d)." % (rule_id, seen[rule_id]))
+        valid = False
+    else:
+        seen[rule_id] = number
+    if severity.lower() not in SEVERITIES:
+        _rule_problem(parsed, number, "Mức độ '%s' không hợp lệ (chỉ blocker, major, minor)." % severity)
+        valid = False
+    section.update({"valid": valid, "id": rule_id, "severity": severity.lower(), "title": title})
+    return section
+
+
+def _rule_body_line(current, line, number, plain, parsed):
+    if current is None:
+        return  # preamble before the first rule heading
+    if plain and not current["started"] and line.strip():
+        current["started"] = True
+        match = _PATHS_LINE_RE.match(line.strip())
+        if match:
+            current["paths"] = []
+            items = _rule_list_items(match.group(1))
+            if not items:
+                _rule_problem(parsed, number, "Dòng paths: chưa có mẫu đường dẫn nào.")
+            for item in items:
+                try:
+                    current["paths"].append(normalize_rule_glob(item))
+                except ValueError:
+                    _rule_problem(parsed, number, "Mẫu đường dẫn '%s' không hợp lệ." % item)
+            return
+    if line.strip():
+        current["started"] = True
+    current["body"].append(line)
+
+
+def _finish_rule(current, parsed, layer):
+    if current is None or not current["valid"]:
+        return
+    body = list(current["body"])
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    severity = current["severity"]
+    downgraded = layer != "project" and severity == "blocker"
+    if downgraded:
+        severity = "major"
+        parsed["downgraded"].append(current["id"])
+    parsed["rules"].append({"id": current["id"], "severity": severity, "title": current["title"],
+                            "paths": current["paths"] or ["**"], "explicit_paths": current["paths"] is not None,
+                            "roots": [""], "layer": layer, "body": "\n".join(body), "line": current["line"],
+                            "downgraded": downgraded})
+
+
+def _raise_shipped_problems(file_name, parsed):
+    if parsed["problems"]:
+        problem = parsed["problems"][0]
+        raise MpsError("internal_error", "File quy tắc đi kèm plugin bị lỗi (%s, dòng %s): %s. Hãy báo người bảo trì "
+                                         "plugin." % (file_name, problem["line"], problem["message"]),
+                       file=file_name, problems=parsed["problems"])
+
+
+def build_effective_rules(base_text, profile_texts, project_text, detected_profiles):
+    """Merge L1 + L2 + L3. profile_texts: {name: text} of every shipped profile; project_text: None = no file;
+    detected_profiles: {name: [roots]}. Returns {rules, ignore, profiles, project_rules, unknown_profiles,
+    downgraded}; project_rules.status is absent | applied | invalid.
+
+    An L3 rule with the id of an earlier rule replaces it in place. An invalid L3 file is skipped entirely: no
+    rules, no extends, no ignore. Rules are ordered by severity, then merge order.
+    """
+    base = parse_rule_file(base_text, "base")
+    _raise_shipped_problems("base.md", base)
+    project = None
+    status = "absent"
+    if project_text is not None:
+        project = parse_rule_file(project_text, "project")
+        status = "invalid" if project["problems"] else "applied"
+    applied = status == "applied"
+    extends = project["extends"] if applied else []
+    unknown_profiles = [name for name in extends if name not in profile_texts]
+    detected = dict((name, roots) for name, roots in (detected_profiles or {}).items() if name in profile_texts)
+    merged = []
+    positions = {}
+
+    def add(rule):
+        if rule["id"] in positions:
+            merged[positions[rule["id"]]] = rule
+        else:
+            positions[rule["id"]] = len(merged)
+            merged.append(rule)
+
+    for rule in base["rules"]:
+        add(dict(rule, roots=[""]))
+    downgraded = list(base["downgraded"])
+    ignore = []
+    profiles = []
+    for name in sorted(set(detected) | set(n for n in extends if n in profile_texts)):
+        in_detected, in_extends = name in detected, name in extends
+        source = "both" if in_detected and in_extends else ("detected" if in_detected else "extends")
+        roots = sorted(set(detected.get(name) or []) | (set([""]) if in_extends else set()))
+        profiles.append({"name": name, "roots": roots, "source": source})
+        parsed = parse_rule_file(profile_texts[name], "profile:" + name)
+        _raise_shipped_problems("profiles/%s.md" % name, parsed)
+        downgraded.extend(parsed["downgraded"])
+        for rule in parsed["rules"]:
+            add(dict(rule, roots=list(roots)))
+        ignore.extend({"glob": glob, "roots": list(roots), "source": "profile:" + name} for glob in parsed["ignore"])
+    if applied:
+        for rule in project["rules"]:
+            add(dict(rule, roots=[""]))
+        ignore.extend({"glob": glob, "roots": [""], "source": "project"} for glob in project["ignore"])
+    ordered = [rule for _, rule in sorted(enumerate(merged), key=lambda p: (SEVERITY_RANK[p[1]["severity"]], p[0]))]
+    return {"rules": ordered, "ignore": ignore, "profiles": profiles,
+            "project_rules": {"status": status, "problems": project["problems"] if project else [],
+                              "unknown_keys": project["unknown_keys"] if applied else []},
+            "unknown_profiles": unknown_profiles, "downgraded": downgraded}
+
+
+def split_ignored(paths, ignore_entries, rules=()):
+    """(reviewed, ignored), order preserved. ignore_entries: [{glob, roots, source}].
+
+    The project's own `ignore` (source "project") always wins. A shipped profile's `ignore` (e.g. Unity's
+    **/*.prefab) does not apply to a path that a project rule (layer "project" in `rules`) names in an explicit
+    `paths:` line: the tech lead asked for that file to be checked. A rule without `paths:` (default `**`) does not
+    count, or every serialized Unity asset would flood the bundle.
+    """
+    project_rules = [rule for rule in rules if rule.get("layer") == "project" and rule.get("explicit_paths")]
+    reviewed = []
+    ignored = []
+    for path in paths:
+        matching = [entry for entry in ignore_entries if path_matches(path, [entry["glob"]], entry["roots"])]
+        if any(entry.get("source") == "project" for entry in matching):
+            ignored.append(path)
+        elif matching and not any(rule_applies(rule, path) for rule in project_rules):
+            ignored.append(path)
+        else:
+            reviewed.append(path)
+    return reviewed, ignored
+
+
+def project_rules_matching_nothing(rules, paths, ignore_entries=()):
+    """Project (L3) rules whose paths match none of `paths` (the files of a branch, plus the changed ones): such a
+    rule can never apply, usually because its paths do not start at the repo root ('Assets/...' for a Unity project
+    in 'Client/Game'). A file the project's own `ignore` hides is never reviewed, so it does not count as a match."""
+    project_ignore = [entry for entry in ignore_entries if entry.get("source") == "project"]
+    remaining = [rule for rule in rules if rule.get("layer") == "project"]
+    for path in paths:
+        if not remaining:
+            break
+        if any(path_matches(path, [entry["glob"]], entry["roots"]) for entry in project_ignore):
+            continue
+        remaining = [rule for rule in remaining if not rule_applies(rule, path)]
+    return remaining
+
+
+def rule_matches_nothing_warning(rule, where):
+    """Warning project_rule_matches_nothing; `where` names the files that were searched (Vietnamese)."""
+    return {"code": "project_rule_matches_nothing", "rule": rule["id"], "paths": rule["paths"],
+            "message": "Quy tắc %s trong %s không khớp file nào %s (paths: %s), nên sẽ không bao giờ được áp dụng. "
+                       "Đường dẫn tính từ gốc repo, ví dụ **/Assets/Scripts/**/*.cs; tech lead cần kiểm tra lại "
+                       "dòng paths:." % (rule["id"], PROJECT_RULES_PATH, where, ", ".join(rule["paths"]))}
+
+
+def _render_rule_block(rule):
+    roots = [r for r in rule["roots"] if r]
+    where = ""
+    if roots and len(roots) == len(rule["roots"]):
+        where = " (relative to %s)" % ", ".join("`%s`" % r for r in roots)
+    lines = ["### %s [%s] %s" % (rule["id"], rule["severity"], rule["title"]),
+             "Applies to: %s%s. Source: %s." % (", ".join("`%s`" % g for g in rule["paths"]), where, rule["layer"])]
+    if rule.get("body"):
+        lines.extend(["", rule["body"]])
+    return "\n".join(lines) + "\n"
+
+
+def render_rules_section(rules):
+    """Section A of the code bundle: one block per rule (also the unit used to size rules for RULES_CAP_CHARS)."""
+    return "\n".join(_render_rule_block(rule) for rule in rules) if rules else "(none)\n"
+
+
+def filter_rules(rules, paths, cap):
+    """Rules that apply to at least one of `paths`, within `cap` characters. Returns (kept, dropped_ids).
+
+    Blocker rules are always kept. Once a major/minor rule does not fit, it and every later non-blocker rule are
+    dropped (rules are ordered by severity, so minor rules go first).
+    """
+    kept = []
+    dropped = []
+    used = 0
+    overflow = False
+    for rule in rules:
+        if not any(rule_applies(rule, path) for path in paths):
+            continue
+        size = len(_render_rule_block(rule)) + 1
+        if rule["severity"] == "blocker":
+            kept.append(rule)
+            used += size
+        elif not overflow and used + size <= cap:
+            kept.append(rule)
+            used += size
+        else:
+            overflow = True
+            dropped.append(rule["id"])
+    return kept, dropped
+
+
+# -- net diff: merge-base -> working tree, rendered with new-file line numbers ---------------------------------
+
+_GIT_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+def _unquote_git_path(raw):
+    """C-quoted git path ('"a/\\303\\251.cs"') -> text ('a/é.cs'); an unquoted path is returned unchanged."""
+    if len(raw) < 2 or raw[0] != '"' or raw[-1] != '"':
+        return raw
+    body = raw[1:-1]
+    out = bytearray()
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\" and index + 1 < len(body):
+            following = body[index + 1]
+            octal = body[index + 1:index + 4]
+            if len(octal) == 3 and all(c in "01234567" for c in octal):
+                out.append(int(octal, 8) & 0xFF)
+                index += 4
+                continue
+            if following in _GIT_C_ESCAPES:
+                out.append(_GIT_C_ESCAPES[following])
+                index += 2
+                continue
+        out.extend(char.encode("utf-8"))
+        index += 1
+    return out.decode("utf-8", "replace")
+
+
+def _git_quoted_token(text):
+    """('"..."' token at the start of `text`, rest) for a C-quoted token, else (None, text)."""
+    if not text.startswith('"'):
+        return None, text
+    index = 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == '"':
+            return text[:index + 1], text[index + 1:]
+        index += 1
+    return None, text
+
+
+def _diff_git_line_path(line):
+    """New path from 'diff --git a/X b/X' (only used when no rename / +++ header names it)."""
+    rest = line[len("diff --git "):]
+    first, after = _git_quoted_token(rest)
+    if first is not None:
+        second = after.strip()
+        path = _unquote_git_path(second) if second.startswith('"') else second
+        return path[2:] if path.startswith("b/") else path
+    half = (len(rest) - 5) // 2
+    if rest[:2] == "a/" and rest[2 + half:5 + half] == " b/" and rest[2:2 + half] == rest[5 + half:]:
+        return rest[2:2 + half]
+    marker = rest.rfind(" b/")
+    return rest[marker + 3:] if marker >= 0 else rest
+
+
+def _diff_side_path(raw, prefix):
+    """Path from a '--- a/..' / '+++ b/..' header (git appends a TAB when the path has a space); None for /dev/null."""
+    path = _unquote_git_path(raw.rstrip("\t"))
+    if path == "/dev/null":
+        return None
+    return path[len(prefix):] if path.startswith(prefix) else path
+
+
+def _new_file_diff(path, status):
+    return {"path": path, "old_path": None, "status": status, "binary": False, "too_large": False,
+            "mode_only": False, "source_cut": False, "lines": []}
+
+
+def _finish_file_diff(entry):
+    meta = entry.pop("_meta")
+    path = meta.get("rename_to") or meta.get("plus") or (meta.get("minus") if meta.get("plus_null") else None)
+    entry["path"] = path or meta["git_line_path"]
+    if meta.get("rename_from") and meta.get("rename_to"):
+        entry["status"] = "renamed"
+        entry["old_path"] = meta["rename_from"]
+    # A modified file without hunks only changed its mode (a pure rename or an empty new file keeps its status).
+    if not any(item[0] == "@" for item in entry["lines"]) and not entry["binary"] and entry["status"] == "modified":
+        entry["mode_only"] = True
+
+
+def parse_diff_files(diff_text):
+    """Parse `git diff` output into [FileDiff]: {path, old_path, status (added|modified|deleted|renamed), binary,
+    too_large, mode_only, source_cut, lines: [[marker, new_line_number_or_None, content]]}.
+
+    Hunk bodies are consumed by their line counts (as in scan_secrets), so content lines such as '--- x' are never
+    taken for headers. Markers: '@' hunk header (content = the whole line), '+', '-', ' ', '\\'.
+    """
+    files = []
+    current = None
+    old_left = new_left = new_no = 0
+    lines = (diff_text or "").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for line in lines:
+        if current is not None and (old_left > 0 or new_left > 0):
+            if line.startswith("+"):
+                current["lines"].append(["+", new_no, line[1:]])
+                new_no += 1
+                new_left -= 1
+            elif line.startswith("-"):
+                current["lines"].append(["-", None, line[1:]])
+                old_left -= 1
+            elif line.startswith("\\"):
+                current["lines"].append(["\\", None, line])
+            else:
+                current["lines"].append([" ", new_no, line[1:]])
+                new_no += 1
+                new_left -= 1
+                old_left -= 1
+            continue
+        if line.startswith("diff --git "):
+            if current is not None:
+                _finish_file_diff(current)
+            current = _new_file_diff(None, "modified")
+            current["_meta"] = {"git_line_path": _diff_git_line_path(line)}
+            files.append(current)
+            continue
+        if current is None:
+            continue
+        meta = current["_meta"]
+        if line.startswith("\\"):
+            current["lines"].append(["\\", None, line])  # '\ No newline' right after a hunk's last counted line
+            continue
+        match = _HUNK_RE.match(line)
+        if match:
+            old_left = int(match.group(1)) if match.group(1) is not None else 1
+            new_no = int(match.group(2))
+            new_left = int(match.group(3)) if match.group(3) is not None else 1
+            current["lines"].append(["@", None, line])
+            continue
+        if line.startswith("new file mode "):
+            current["status"] = "added"
+        elif line.startswith("deleted file mode "):
+            current["status"] = "deleted"
+        elif line.startswith("rename from "):
+            meta["rename_from"] = _unquote_git_path(line[len("rename from "):])
+        elif line.startswith("rename to "):
+            meta["rename_to"] = _unquote_git_path(line[len("rename to "):])
+        elif line.startswith("--- "):
+            meta["minus"] = _diff_side_path(line[4:], "a/")
+        elif line.startswith("+++ "):
+            plus = _diff_side_path(line[4:], "b/")
+            meta["plus"] = plus
+            meta["plus_null"] = plus is None
+        elif line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            current["binary"] = True
+    if current is not None:
+        _finish_file_diff(current)
+    return files
+
+
+def untracked_file_diff(path, text, kind, cut):
+    """FileDiff for an untracked file: every line added (numbers 1..n). kind: text | binary | too_large."""
+    entry = _new_file_diff(path, "untracked")
+    entry["binary"] = kind == "binary"
+    entry["too_large"] = kind == "too_large"
+    entry["source_cut"] = bool(cut)
+    if kind == "text":
+        body = (text or "").split("\n")
+        if body and body[-1] == "":
+            body.pop()
+        entry["lines"] = [["+", index + 1, content] for index, content in enumerate(body)]
+    return entry
+
+
+def _file_kind(entry):
+    if entry["status"] == "deleted":
+        return "deleted"
+    if entry["too_large"]:
+        return "too_large"
+    if entry["binary"]:
+        return "binary"
+    return "text"
+
+
+_KIND_TAGS = {"deleted": "deleted - only file-level findings, use line -",
+              "binary": "binary - only file-level findings, use line -",
+              "too_large": "too large - only file-level findings, use line -"}
+
+
+def _file_tag(entry, kind):
+    if kind in _KIND_TAGS:
+        return _KIND_TAGS[kind]
+    if entry["status"] == "renamed":
+        return "renamed from %s" % entry["old_path"]
+    if entry["status"] == "untracked":
+        return "untracked (new file)"
+    if entry["mode_only"]:
+        return "mode change only"
+    return entry["status"]
+
+
+def _numbered_line(marker, number, content, line_cap):
+    if marker == "@":
+        return content
+    if marker == "\\":
+        return "%6s %s" % ("", content)
+    if content.endswith("\r"):
+        content = content[:-1]
+    if len(content) > line_cap:
+        content = content[:line_cap] + " [... dòng bị cắt bớt ...]"
+    return "%6s %s %s" % ("" if number is None else number, marker, content)
+
+
+def _merge_ranges(numbers):
+    ranges = []
+    for number in sorted(set(numbers)):
+        if ranges and number == ranges[-1][1] + 1:
+            ranges[-1][1] = number
+        else:
+            ranges.append([number, number])
+    return ranges
+
+
+def render_numbered_diff(files, cap, line_cap=DIFF_LINE_CAP_CHARS):
+    """Section C of the code bundle, cut at line boundaries so that `cap` characters are never exceeded (None =
+    unlimited). The ranges come from the same pass, so they describe exactly what the reviewer saw.
+
+    Returns {text, ranges: {path: [[start, end]]} (text files), file_kinds: {path: text|binary|deleted|too_large|
+    not_shown}, truncated_paths, shown_last_line: {path: n}}.
+    """
+    out = []
+    state = {"used": 0, "stop": False}
+    ranges = {}
+    kinds = {}
+    truncated = []
+    last_line = {}
+
+    def fits(text):
+        return cap is None or state["used"] + len(text) + 1 <= cap
+
+    def emit(text):
+        out.append(text)
+        state["used"] += len(text) + 1
+
+    for entry in files:
+        path = entry["path"]
+        header = "### %s  [%s]" % (path, _file_tag(entry, _file_kind(entry)))
+        if state["stop"] or not fits(header):
+            state["stop"] = True
+            kinds[path] = "not_shown"
+            truncated.append(path)
+            continue
+        kind = _file_kind(entry)
+        kinds[path] = kind
+        header_index = len(out)
+        emit(header)
+        if kind != "text":
+            continue
+        numbers = []
+        hunk = {"start": None, "numbered": False, "removed": False}
+
+        def close_hunk():
+            if hunk["start"] is not None and not hunk["numbered"] and hunk["removed"]:
+                numbers.append(max(hunk["start"], 1))  # deletion-only hunk (file emptied): cite line 1
+
+        cut = False
+        for marker, number, content in entry["lines"]:
+            rendered = _numbered_line(marker, number, content, line_cap)
+            if not fits(rendered):
+                state["stop"] = True
+                cut = True
+                break
+            emit(rendered)
+            if marker == "@":
+                close_hunk()
+                match = _HUNK_RE.match(content)
+                hunk.update({"start": int(match.group(2)) if match else None, "numbered": False, "removed": False})
+            elif marker == "-":
+                hunk["removed"] = True
+            elif number is not None:
+                hunk["numbered"] = True
+                numbers.append(number)
+        close_hunk()
+        ranges[path] = _merge_ranges(numbers)
+        if numbers:
+            last_line[path] = max(numbers)
+        if cut or entry["source_cut"]:
+            truncated.append(path)
+            shown = last_line.get(path)
+            out[header_index] += (" - TRUNCATED: shown up to line %d" % shown) if shown else " - TRUNCATED: no lines shown"
+    return {"text": "\n".join(out) + ("\n" if out else ""), "ranges": ranges, "file_kinds": kinds,
+            "truncated_paths": truncated, "shown_last_line": last_line}
+
+
+def parse_changed_ranges(diff_text):
+    """{path: [[start, end]]} on the new side of a unified diff, context lines included."""
+    return render_numbered_diff(parse_diff_files(diff_text), None)["ranges"]
+
+
+# -- findings: the code reviewer's FINDINGS: block -------------------------------------------------------------
+
+_EN_DASH = chr(0x2013)
+_FINDINGS_HEADER_RE = re.compile(r"^\s*(?:[-*]\s+)?FINDINGS:[ \t]*(?:`?((?i:none))`?)?[ \t]*$")
+_FENCE_LINE_RE = re.compile(r"^\s*(```|~~~)")
+# A list marker before a finding: "- ", "* ", "1. " or "1) ".
+_BULLET_RE = re.compile(r"^\s*(?:[-*]\s+|[0-9]+[.)]\s*)?")
+# Markdown emphasis / code marks a reviewer may put around the rule id (`ID`, **ID**, _ID_).
+_RULE_ID_MARKS = "`*_ \t"
+_LINE_SPEC_RE = re.compile(r"^([1-9][0-9]*)(?:[ \t]*[-" + _EN_DASH + r"][ \t]*([1-9][0-9]*))?$")
+
+
+def _bad_finding(raw, error):
+    return {"ok": False, "raw": raw, "error": error}
+
+
+def _parse_finding_line(raw):
+    """`<RULE-ID> | <severity> | <path>:<line|N-M|-> | <problem> | <suggestion>` -> entry ({"ok": False} if bad)."""
+    text = raw.strip()
+    parts = _BULLET_RE.sub("", raw, count=1).split("|", 4)
+    if len(parts) < 5:
+        return _bad_finding(text, "needs 5 fields separated by |")
+    rule, severity, location, problem, suggestion = [part.strip() for part in parts]
+    rule = rule.strip(_RULE_ID_MARKS)
+    severity = severity.strip("`").strip().lower()
+    location = location.strip("`").strip()
+    if not rule:
+        return _bad_finding(text, "empty rule id")
+    if severity not in SEVERITIES:
+        return _bad_finding(text, "unknown severity")
+    if ":" not in location:
+        return _bad_finding(text, "location needs path:line")
+    path, spec = location.rsplit(":", 1)
+    path = path.strip().strip("`").replace("\\", "/")
+    if path.startswith("./"):
+        path = path[2:]
+    spec = spec.strip()
+    if spec == "-":
+        start = end = None
+        line = "-"
+    else:
+        match = _LINE_SPEC_RE.match(spec)
+        if not match:
+            return _bad_finding(text, "bad line number")
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else start
+        if end < start:
+            return _bad_finding(text, "line range ends before it starts")
+        line = str(start) if end == start else "%d-%d" % (start, end)
+    if not path or not problem or not suggestion:
+        return _bad_finding(text, "empty path, problem or suggestion")
+    return {"ok": True, "raw": text, "rule": rule, "severity": severity, "path": path, "line": line,
+            "line_start": start, "line_end": end, "problem": problem, "suggestion": suggestion}
+
+
+_AMBIGUOUS_FINDINGS = "more than one FINDINGS block, or a FINDINGS block without BUNDLE before the next one"
+_TEXT_AFTER_BLOCK = "text between the end of the FINDINGS block and BUNDLE"
+
+
+def _findings_blocks(lines):
+    """Every block: a `FINDINGS:` header, then its body up to its own `BUNDLE:` line (complete) or, without one, up
+    to the next header or the end of the text."""
+    headers = [index for index, line in enumerate(lines) if _FINDINGS_HEADER_RE.match(line)]
+    blocks = []
+    for number, header in enumerate(headers):
+        stop = headers[number + 1] if number + 1 < len(headers) else len(lines)
+        end = None
+        for index in range(header + 1, stop):
+            if _REVIEW_BUNDLE_RE.match(lines[index]):
+                end = index
+                break
+        blocks.append({"header": lines[header].strip(),
+                       "is_none": bool(_FINDINGS_HEADER_RE.match(lines[header]).group(1)),
+                       "body": lines[header + 1:stop if end is None else end],
+                       "bundle_id": _REVIEW_BUNDLE_RE.match(lines[end]).group(1).lower() if end is not None else None})
+    return blocks
+
+
+def _parse_findings_body(block):
+    """Finding entries of one block. Its lines may sit inside one code block that opens right after the header;
+    otherwise a code fence ends them. Anything after that end (before BUNDLE) is a bad line, never ignored."""
+    entries = []
+    state = "start"  # start -> open (plain lines) | fenced -> ended
+    for line in block["body"]:
+        if not line.strip():
+            continue
+        fence = _FENCE_LINE_RE.match(line)
+        if state == "ended":
+            if not fence:
+                entries.append(_bad_finding(line.strip(), _TEXT_AFTER_BLOCK))
+        elif fence:
+            state = "fenced" if state == "start" else "ended"
+        else:
+            state = "fenced" if state == "fenced" else "open"
+            entries.append(_bad_finding(line.strip(), "text after FINDINGS: none") if block["is_none"]
+                           else _parse_finding_line(line))
+    if not block["is_none"] and not entries:
+        entries.append(_bad_finding(block["header"], "FINDINGS: without findings (write FINDINGS: none)"))
+    return entries
+
+
+def parse_findings(text):
+    """Reviewer reply -> (entries or None, bundle id or None). None = no `FINDINGS:` block at all.
+
+    Fails closed: the reply must hold exactly one block (`FINDINGS:` ... `BUNDLE:`); identical repeats are
+    tolerated. Several different blocks, or two headers without a BUNDLE line between them, give one bad line, so
+    the review is incomplete and the reviewer must answer again. Blocks are never told apart by their bundle id: a
+    quoted block with a mistyped id could hold the real blocker. `FINDINGS: none` followed by any line, and a plain
+    `FINDINGS:` without finding lines, are bad lines too.
+    """
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    blocks = _findings_blocks(lines)
+    if not blocks:
+        return None, None
+    last_bundle = None
+    for block in blocks:
+        last_bundle = block["bundle_id"] or last_bundle
+    signatures = set((block["is_none"], tuple(line.strip() for line in block["body"] if line.strip()),
+                      block["bundle_id"]) for block in blocks)
+    if len(signatures) > 1 or any(b["bundle_id"] is None for b in blocks[:-1]):
+        return [_bad_finding(blocks[-1]["header"], _AMBIGUOUS_FINDINGS)], last_bundle
+    return _parse_findings_body(blocks[-1]), blocks[-1]["bundle_id"]
+
+
+def _location_ok(entry, kind, path_ranges):
+    if kind in ("binary", "deleted", "too_large"):
+        return entry["line_start"] is None
+    if kind != "text" or entry["line_start"] is None:
+        return False
+    return any(entry["line_start"] <= end and entry["line_end"] >= start for start, end in path_ranges)
+
+
+def verify_findings(entries, code_review, candidates):
+    """Check each finding against what the code reviewer was really shown (rules, files, numbered lines).
+
+    Returns {complete, findings, blockers, rule_warnings, blockers_in_candidates, blocked_paths, dropped_findings,
+    dropped_count, duplicate_count}. Severity always comes from the rule. The review is incomplete when a line is
+    malformed, or a finding that cites a blocker rule or that the reviewer marked `blocker` could not be matched:
+    blockers never fail silently.
+    """
+    rules = dict((rule["id"], rule) for rule in code_review.get("rules") or [])
+    reviewed = set(code_review.get("reviewed_paths") or [])
+    ignored = set(code_review.get("ignored_paths") or [])
+    kinds = code_review.get("file_kinds") or {}
+    ranges = code_review.get("ranges") or {}
+    findings = []
+    dropped = []
+    seen = set()
+    for entry in entries:
+        rule = rules.get(entry.get("rule")) if entry["ok"] else None
+        if not entry["ok"]:
+            reason = "bad_format"
+        elif rule is None:
+            reason = "unknown_rule"
+        elif entry["path"] in ignored:
+            reason = "path_ignored"
+        elif entry["path"] not in reviewed:
+            reason = "path_not_reviewed"
+        elif not rule_applies(rule, entry["path"]):
+            reason = "rule_not_applicable"
+        elif not _location_ok(entry, kinds.get(entry["path"]), ranges.get(entry["path"]) or []):
+            reason = "line_outside_changes"
+        elif (rule["id"], entry["path"], entry["line_start"], entry["line_end"]) in seen:
+            reason = "duplicate"
+        else:
+            reason = None
+        if reason:
+            # A blocker never fails silently: neither a blocker rule nor a finding the reviewer called a blocker
+            # (e.g. a mistyped rule id) may be dropped without the reviewer fixing its reply.
+            dropped.append({"raw": entry["raw"], "reason": reason, "rule": entry.get("rule"),
+                            "blocker_rule": bool(rule and rule["severity"] == "blocker"),
+                            "blocker_claimed": entry.get("severity") == "blocker"})
+            continue
+        seen.add((rule["id"], entry["path"], entry["line_start"], entry["line_end"]))
+        findings.append({"rule": rule["id"], "severity": rule["severity"], "title": rule["title"],
+                         "layer": rule["layer"], "path": entry["path"], "line": entry["line"],
+                         "line_start": entry["line_start"], "line_end": entry["line_end"],
+                         "problem": entry["problem"], "suggestion": entry["suggestion"],
+                         "severity_corrected": entry["severity"] != rule["severity"]})
+    blockers = [f for f in findings if f["severity"] == "blocker"]
+    in_candidates = [f for f in blockers if f["path"] in candidates]
+    duplicates = len([d for d in dropped if d["reason"] == "duplicate"])
+    complete = not any(d["reason"] == "bad_format"
+                       or ((d["blocker_rule"] or d["blocker_claimed"]) and d["reason"] != "duplicate")
+                       for d in dropped)
+    return {"complete": complete, "findings": findings, "blockers": blockers,
+            "rule_warnings": ([f for f in findings if f["severity"] == "major"]
+                              + [f for f in findings if f["severity"] == "minor"]),
+            "blockers_in_candidates": in_candidates,
+            "blocked_paths": sorted(set(f["path"] for f in in_candidates)),
+            "dropped_findings": dropped, "dropped_count": len(dropped) - duplicates, "duplicate_count": duplicates}
+
+
+def blockers_for_commit(review, committing_paths):
+    """Blockers whose file is being committed now or was already committed on the branch (A3)."""
+    paths = set(committing_paths) | set(review.get("already_committed") or [])
+    return [f for f in review.get("blockers") or [] if f["path"] in paths]
+
+
+def code_review_warning_items(review):
+    """Accepted major / minor findings on committed files, majors first (what the MR report lists)."""
+    committed = set(review.get("committed_paths") or [])
+    findings = [f for f in review.get("findings") or [] if f["path"] in committed]
+    return [f for f in findings if f["severity"] == "major"] + [f for f in findings if f["severity"] == "minor"]
+
+
+# -- merge request report ----------------------------------------------------------------------------------------
+
+# GitLab cross-links or notifies on Jira keys (also "UTF-8"), and on references built with @ # ! ~ $ (users,
+# issues, MRs - also "group/proj#12" or "proj!12" -, labels, snippets) unless they sit inside a code span.
+_MD_JIRA_KEY_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9_]*-[0-9]+)(?![A-Za-z0-9_])")
+_MD_REFERENCE_CHARS = "@#!~$"
+
+
+def _md_inline_token(token):
+    if any(char in token for char in _MD_REFERENCE_CHARS):
+        return "`%s`" % token  # the whole token, so a project prefix such as group/proj#12 stays inside
+    return _MD_JIRA_KEY_RE.sub(lambda m: "`%s`" % m.group(1), token.replace("|", "\\|"))
+
+
+def _md_inline(text):
+    """One-line markdown-safe text: whitespace collapsed, '`' -> "'" (so a code span can never be broken), '|'
+    escaped, and every token that GitLab could turn into a reference or mention put in a code span."""
+    return " ".join(_md_inline_token(token) for token in (text or "").replace("`", "'").split())
+
+
+def _md_code(text):
+    return "`%s`" % " ".join((text or "").split()).replace("`", "'")
+
+
+def _short_list(items, limit, rendered=None):
+    shown = [rendered(i) if rendered else i for i in items[:limit]]
+    text = ", ".join(shown)
+    if len(items) > limit:
+        text += " và %d mục khác" % (len(items) - limit)
+    return text
+
+
+def render_mr_review_section(review):
+    """Markdown report of a committed code review for the merge request (Vietnamese). Free text goes through
+    _md_inline and paths / rule ids are code spans, so nothing in it links a Jira ticket or pings a user."""
+    project_rules = review.get("project_rules") or {}
+    status = project_rules.get("status")
+    base = review.get("base") or ""
+    parts = ["### Kết quả review code tự động", ""]
+    if status == "invalid":
+        problems = project_rules.get("problems") or []
+        parts.append("> **Quy tắc riêng của dự án KHÔNG được áp dụng:** file `%s` trên nhánh %s bị lỗi định dạng, nên "
+                     "lần review này chỉ dùng quy tắc chung của team và quy tắc theo công nghệ. Developer cần sửa "
+                     "file này." % (PROJECT_RULES_PATH, _md_code(base)))
+        for problem in problems[:MR_PROBLEMS_SHOWN]:
+            parts.append("> - dòng %s: %s" % (problem.get("line"), _md_inline(problem.get("message"))))
+        if len(problems) > MR_PROBLEMS_SHOWN:
+            parts.append("> - … và %d lỗi khác" % (len(problems) - MR_PROBLEMS_SHOWN))
+        parts.append("")
+    truncated_paths = review.get("truncated_paths") or []
+    if review.get("truncated"):
+        parts.extend(["> **Review chưa đầy đủ:** thay đổi quá lớn nên một số file không được xem hết: %s."
+                      % _short_list(truncated_paths, MR_PATHS_SHOWN, _md_code), ""])
+    if project_rules.get("pending_change"):
+        parts.extend(["> Thay đổi quy tắc trong `%s` của MR này chỉ có hiệu lực sau khi được merge."
+                      % PROJECT_RULES_PATH, ""])
+    profiles = review.get("profiles") or []
+    stack = "; ".join("%s (%s)" % (_md_code(p["name"]), ", ".join(_md_code(r) if r else "gốc repo"
+                                                                  for r in p.get("roots") or [""]))
+                      for p in profiles) or "không có"
+    if status == "applied":
+        project = _md_code("origin/%s:%s" % (base, PROJECT_RULES_PATH))
+    elif status == "invalid":
+        project = "không áp dụng (file lỗi)"
+    else:
+        project = "chưa có file `%s`" % PROJECT_RULES_PATH
+    parts.extend(["Quy tắc đã dùng: chung của team; công nghệ: %s; dự án: %s." % (stack, project), ""])
+    items = code_review_warning_items(review)
+    if review.get("auto") == "nothing_to_review":
+        parts.append("Không có file nào cần review code theo quy tắc (chỉ có file được bỏ qua, hoặc không quy tắc "
+                     "nào áp dụng cho các file đã đổi).")
+    elif not items:
+        parts.append("Không có cảnh báo.")
+    else:
+        shown = items[:MR_REVIEW_MAX_ITEMS]
+        for severity in ("major", "minor"):
+            group = [f for f in shown if f["severity"] == severity]
+            if group:
+                parts.append("**Cảnh báo mức %s:**" % severity)
+                for finding in group:
+                    location = finding["path"] if finding["line"] == "-" else "%s:%s" % (finding["path"],
+                                                                                         finding["line"])
+                    parts.append("- %s · %s · %s · Gợi ý: %s" % (_md_code(finding["rule"]), _md_code(location),
+                                                                _md_inline(finding["problem"]),
+                                                                _md_inline(finding["suggestion"])))
+        if len(items) > MR_REVIEW_MAX_ITEMS:
+            parts.append("… và %d mục khác" % (len(items) - MR_REVIEW_MAX_ITEMS))
+    return "\n".join(parts).rstrip("\n") + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Pure helpers: Jira
 # ---------------------------------------------------------------------------
 
@@ -2021,6 +3074,16 @@ def origin_base_candidates(root, branches):
     return [n for n in names if ref_exists(root, "refs/remotes/origin/" + n)]
 
 
+def _source_ref(root, source):
+    """What an MR from `source` contains: origin/<source> (the pushed branch) when it exists, else the local branch."""
+    if ref_exists(root, "refs/remotes/origin/" + source):
+        return "refs/remotes/origin/" + source
+    if ref_exists(root, "refs/heads/" + source):
+        return "refs/heads/" + source
+    raise MpsError("branch_not_found", "Không có nhánh %s trên máy lẫn trên GitLab (đã push chưa?)." % source,
+                   branch=source)
+
+
 def ensure_mr_target(root, source, target, key, branches):
     """Offline guard before creating/reusing an MR.
 
@@ -2038,13 +3101,7 @@ def ensure_mr_target(root, source, target, key, branches):
     if not ref_exists(root, "refs/remotes/origin/" + target):
         raise MpsError("base_not_found", "Chưa có origin/%s trên máy (nhánh đích không tồn tại hoặc chưa tải về)."
                        % target, base=target)
-    if ref_exists(root, "refs/remotes/origin/" + source):
-        source_ref = "refs/remotes/origin/" + source
-    elif ref_exists(root, "refs/heads/" + source):
-        source_ref = "refs/heads/" + source
-    else:
-        raise MpsError("branch_not_found", "Không có nhánh %s trên máy lẫn trên GitLab (đã push chưa?)." % source,
-                       branch=source)
+    source_ref = _source_ref(root, source)
     if not recorded:
         counts = {}
         for name in origin_base_candidates(root, branches):
@@ -2535,7 +3592,7 @@ def cmd_env_set(args):
 # Commands: project (lead)
 # ---------------------------------------------------------------------------
 
-PROJECT_SETUP_FILES = (PROJECT_SETTINGS_PATH, ".gitignore")
+PROJECT_SETUP_FILES = (PROJECT_SETTINGS_PATH, ".gitignore", PROJECT_RULES_PATH)
 
 
 def _read_project_settings_text(path):
@@ -2575,12 +3632,52 @@ def cmd_project_setup(args):
         warnings.append({"code": "settings_ignored_by_git",
                          "message": "File %s đang bị .gitignore bỏ qua nên thành viên sẽ không nhận được. Cần bỏ dòng "
                                     "ignore tương ứng rồi commit file." % PROJECT_SETTINGS_PATH})
-    written = {PROJECT_SETTINGS_PATH: bool(changes), ".gitignore": gitignore_updated}
+    review_rules, review_written, review_problems = _project_review_rules(root, args.review_rules, warnings)
+    written = {PROJECT_SETTINGS_PATH: bool(changes), ".gitignore": gitignore_updated, PROJECT_RULES_PATH: review_written}
     pending = set(_changed_paths(git_status(root)))
     files_to_commit = [p for p in PROJECT_SETUP_FILES if written[p] or p in pending]
     return {"settings_path": path, "created": created, "changed": bool(changes), "changes": changes,
             "gitignore_updated": gitignore_updated, "files_to_commit": files_to_commit, "warnings": warnings,
+            "review_rules": review_rules, "review_rules_path": os.path.join(root, *PROJECT_RULES_PATH.split("/")),
+            "review_rules_problems": review_problems,
             "next": "commit_with_mps_git_flow" if files_to_commit else None}
+
+
+def _project_review_rules(root, scaffold, warnings):
+    """State of the project's code review rules in the working tree: (status, written, problems).
+
+    status: "present" (the file exists; `problems` lists format problems of the local copy, and a rule whose paths
+    match no tracked file adds a project_rule_matches_nothing warning), "absent", or "created" (scaffold=True and
+    there was no file: written from the template, which holds no active rule). An existing file is never
+    overwritten.
+    """
+    path = os.path.join(root, *PROJECT_RULES_PATH.split("/"))
+    if os.path.isfile(path):
+        parsed = parse_rule_file(read_text_file(path), "project")
+        if parsed["rules"]:
+            tracked = [p for p in run_git(["ls-files", "-z"], root).stdout.split("\0") if p]
+            own_ignore = [{"glob": glob, "roots": [""], "source": "project"} for glob in parsed["ignore"]]
+            warnings.extend(rule_matches_nothing_warning(rule, "trong repo")
+                            for rule in project_rules_matching_nothing(parsed["rules"], tracked, own_ignore))
+        return "present", False, parsed["problems"]
+    if not scaffold:
+        return "absent", False, []
+    try:
+        template = _read_bytes_file(REVIEW_RULES_TEMPLATE_PATH)
+    except (IOError, OSError):
+        raise MpsError("template_missing", "Không tìm thấy file mẫu review.example.md của skill.",
+                       template=REVIEW_RULES_TEMPLATE_PATH)
+    folder = os.path.dirname(path)
+    if not os.path.isdir(folder):
+        os.makedirs(folder)
+    with open(path, "xb") as handle:
+        handle.write(template)
+    return "created", True, []
+
+
+def _read_bytes_file(path):
+    with open(path, "rb") as handle:
+        return handle.read()
 
 
 # ---------------------------------------------------------------------------
@@ -2752,6 +3849,60 @@ def unity_project_roots(root, paths):
         if os.path.isfile(os.path.join(root, folder, *UNITY_VERSION_FILE.split("/"))):
             roots.add(folder)
     return sorted(roots)
+
+
+PYTHON_PROJECT_MARKERS = ("pyproject.toml", "setup.py")
+WEB_PROJECT_MARKERS = ("package.json",)
+
+
+def _ancestor_folders(paths):
+    """"" plus every folder above each path (the candidate stack roots)."""
+    folders = set([""])
+    for path in paths:
+        parts = path.split("/")[:-1]
+        folders.update("/".join(parts[:depth]) for depth in range(1, len(parts) + 1))
+    return folders
+
+
+def _repo_folder(root, folder):
+    return os.path.join(root, *folder.split("/")) if folder else root
+
+
+def _folder_has_python_project(root, folder):
+    directory = _repo_folder(root, folder)
+    if any(os.path.isfile(os.path.join(directory, name)) for name in PYTHON_PROJECT_MARKERS):
+        return True
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return False
+    return any(n.startswith("requirements") and n.endswith(".txt") and os.path.isfile(os.path.join(directory, n))
+               for n in names)
+
+
+def detect_profiles(root, paths):
+    """Shipped rule profiles that apply to the changed `paths`: {name: [roots]} (only non-empty entries).
+
+    unity-csharp: Unity project roots; python: folders with pyproject.toml, setup.py or requirements*.txt; web:
+    folders with package.json - each looked up on disk in the repo root and every folder above a changed path.
+
+    Reading the working tree (not origin/<base>) is deliberate and safe: profiles only add shipped major / minor
+    rules and shipped ignore globs, and a project rule overrides those ignores (split_ignored). Project blockers
+    always come from origin/<base>, so nothing on the user's disk can switch one off.
+    """
+    detected = {}
+    unity = unity_project_roots(root, paths)
+    if unity:
+        detected["unity-csharp"] = unity
+    folders = sorted(_ancestor_folders(paths))
+    python = [f for f in folders if _folder_has_python_project(root, f)]
+    if python:
+        detected["python"] = python
+    web = [f for f in folders if any(os.path.isfile(os.path.join(_repo_folder(root, f), name))
+                                     for name in WEB_PROJECT_MARKERS)]
+    if web:
+        detected["web"] = web
+    return detected
 
 
 def work_in_progress(root, extra_patterns):
@@ -3101,8 +4252,231 @@ def _create_from_base(root, args):
 _REVIEW_EXCLUDES = ["--", ".", ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*"]
 
 
+def code_review_path(root):
+    return os.path.join(mps_tmp_dir(root), CODE_REVIEW_FILENAME)
+
+
+def committed_review_path(root):
+    return os.path.join(mps_tmp_dir(root), COMMITTED_REVIEW_FILENAME)
+
+
+def _write_json(path, data):
+    write_file_atomically(path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def _remove_if_exists(path):
+    if os.path.isfile(path):
+        os.remove(path)
+
+
+def _read_shipped_rule_file(relative):
+    path = os.path.join(REVIEW_RULES_DIR, *relative.split("/"))
+    try:
+        return read_text_file(path)
+    except (IOError, OSError):
+        raise MpsError("internal_error", "Thiếu file quy tắc đi kèm plugin (%s). Hãy báo người bảo trì plugin."
+                       % relative, file=relative)
+
+
+def _load_shipped_rules():
+    """(base.md text, {profile name: text}) shipped with the plugin."""
+    profiles = dict((name, _read_shipped_rule_file("profiles/%s.md" % name)) for name in SHIPPED_PROFILES)
+    return _read_shipped_rule_file("base.md"), profiles
+
+
+def _read_project_rules(root, base):
+    """Text of .mps/review.md on origin/<base> (never the working-tree copy), or None when the file is absent."""
+    spec = "origin/%s:%s" % (base, PROJECT_RULES_PATH)
+    kind = run_git(["cat-file", "-t", spec], root, check=False)
+    if not kind.ok or kind.stdout.strip() != "blob":
+        return None
+    return run_git(["cat-file", "blob", spec], root).stdout
+
+
+def _net_diff(root, base_ref):
+    """(merge base or None, diff text): merge-base(origin/<base>, HEAD) -> working tree (staged and unstaged) for every
+    tracked path, i.e. the net change of the merge request. Without a HEAD the empty tree is the left side."""
+    merge_base = None
+    if head_exists(root):
+        merge_base = run_git(["merge-base", base_ref, "HEAD"], root).stdout.strip() or None
+    left = merge_base or run_git(["hash-object", "-t", "tree", "--stdin"], root, input_bytes=b"").stdout.strip()
+    # Explicit options so user config (diff.noprefix, diff.renames, textconv, color) cannot change the format.
+    diff = run_git(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/",
+                    "--dst-prefix=b/", "-U3", left] + _REVIEW_EXCLUDES, root).stdout
+    return merge_base, diff
+
+
+def _untracked_file_diffs(root, untracked_paths):
+    """FileDiffs for untracked files (sorted by path); .env files and vanished files are skipped."""
+    files = []
+    for path in sorted(untracked_paths):
+        if is_env_file(path):
+            continue
+        text, size, kind = _read_worktree_file(root, path, UNTRACKED_FILE_CAP_CHARS * MAX_UTF8_BYTES_PER_CHAR)
+        if kind == "missing":
+            continue
+        cut = False
+        if kind == "text" and (len(text) > UNTRACKED_FILE_CAP_CHARS
+                               or size > UNTRACKED_FILE_CAP_CHARS * MAX_UTF8_BYTES_PER_CHAR):
+            cut = True
+            text = text[:UNTRACKED_FILE_CAP_CHARS]
+            text = text[:text.rfind("\n") + 1]  # whole lines only
+        files.append(untracked_file_diff(path, text, kind, cut))
+    return files
+
+
+def _code_review_warnings(base, effective, project_rules, dropped_ids, truncated_paths, unmatched_rules):
+    warnings = []
+    if project_rules["status"] == "invalid":
+        warnings.append({"code": "project_rules_invalid", "problems": project_rules["problems"],
+                         "message": "File quy tắc review của dự án (%s trên nhánh %s) bị lỗi định dạng nên KHÔNG được áp "
+                                    "dụng; chỉ dùng quy tắc chung của team. Hãy báo developer sửa file."
+                                    % (PROJECT_RULES_PATH, base)})
+    if project_rules["pending_change"]:
+        warnings.append({"code": "project_rules_pending",
+                         "message": "Thay đổi này có sửa file quy tắc review %s. Quy tắc mới chỉ có hiệu lực sau khi được "
+                                    "merge vào %s; lần review này vẫn dùng bản trên %s." % (PROJECT_RULES_PATH, base, base)})
+    if project_rules["unknown_keys"]:
+        warnings.append({"code": "project_rules_unknown_key", "keys": project_rules["unknown_keys"],
+                         "message": "Phần đầu file %s có khoá không được hỗ trợ: %s. Các khoá này bị bỏ qua (phiên bản này "
+                                    "chưa hỗ trợ disable)." % (PROJECT_RULES_PATH, ", ".join(project_rules["unknown_keys"]))})
+    if effective["unknown_profiles"]:
+        warnings.append({"code": "unknown_profile", "profiles": effective["unknown_profiles"],
+                         "available": list(SHIPPED_PROFILES),
+                         "message": "File %s khai báo bộ quy tắc không có sẵn trong extends: %s. Bỏ qua; các bộ có sẵn: %s."
+                                    % (PROJECT_RULES_PATH, ", ".join(effective["unknown_profiles"]),
+                                       ", ".join(SHIPPED_PROFILES))})
+    warnings.extend(rule_matches_nothing_warning(rule, "trên nhánh %s" % base) for rule in unmatched_rules)
+    if effective["downgraded"]:
+        warnings.append({"code": "shipped_blocker_downgraded", "rules": effective["downgraded"],
+                         "message": "Quy tắc đi kèm plugin không được phép chặn commit; đã hạ %s xuống mức major."
+                                    % _short_list(effective["downgraded"], WARNING_ITEMS_SHOWN)})
+    if dropped_ids:
+        warnings.append({"code": "rules_truncated", "rules": dropped_ids,
+                         "message": "Có quá nhiều quy tắc nên %d quy tắc mức thấp không được gửi cho reviewer lần này: %s."
+                                    % (len(dropped_ids), _short_list(dropped_ids, WARNING_ITEMS_SHOWN))})
+    if truncated_paths:
+        warnings.append({"code": "code_bundle_truncated", "files": truncated_paths,
+                         "message": "Thay đổi quá lớn nên reviewer code chỉ xem được một phần; các file chưa được xem hết: "
+                                    "%s. Kết quả review code sẽ ghi rõ là chưa đầy đủ."
+                                    % _short_list(truncated_paths, WARNING_ITEMS_SHOWN)})
+    return warnings
+
+
+def _build_code_review(root, base, to_classify, already_committed, untracked_paths):
+    """(code bundle text without its header, meta = bundle.json "code_review") for `diff-for-review --to-file`."""
+    merge_base, diff_text = _net_diff(root, "origin/" + base)
+    files = parse_diff_files(diff_text) + _untracked_file_diffs(root, untracked_paths)
+    changed = [entry["path"] for entry in files]
+    base_text, profile_texts = _load_shipped_rules()
+    effective = build_effective_rules(base_text, profile_texts, _read_project_rules(root, base),
+                                      detect_profiles(root, changed))
+    reviewed, ignored = split_ignored(changed, effective["ignore"], effective["rules"])
+    kept, dropped_ids = filter_rules(effective["rules"], reviewed, RULES_CAP_CHARS)
+    reviewed_set = set(reviewed)
+    rendered = render_numbered_diff([entry for entry in files if entry["path"] in reviewed_set], REVIEW_CAP_CHARS)
+    project_rules = dict(effective["project_rules"])
+    project_rules.update({"pending_change": PROJECT_RULES_PATH in list(to_classify) + list(already_committed),
+                          "source": "origin/%s:%s" % (base, PROJECT_RULES_PATH)})
+    unmatched = []
+    if any(rule["layer"] == "project" for rule in effective["rules"]):
+        base_files = [p for p in run_git(["ls-tree", "-r", "-z", "--name-only", "origin/" + base], root).stdout
+                      .split("\0") if p]
+        # Plus the changed paths: a rule for a folder that this change creates is not a mistake.
+        unmatched = project_rules_matching_nothing(effective["rules"], changed + base_files, effective["ignore"])
+    meta = {
+        "version": CODE_REVIEW_VERSION,
+        "merge_base": merge_base,
+        "reviewed_paths": reviewed,
+        "ignored_paths": ignored,
+        "ranges": rendered["ranges"],
+        "file_kinds": rendered["file_kinds"],
+        "truncated_paths": rendered["truncated_paths"],
+        "truncated": bool(rendered["truncated_paths"]),
+        "rules": [dict((key, rule[key]) for key in ("id", "severity", "layer", "title", "paths", "roots"))
+                  for rule in kept],
+        "rules_dropped": dropped_ids,
+        "profiles": effective["profiles"],
+        "project_rules": project_rules,
+        "auto": "nothing_to_review" if not reviewed or not kept else None,
+        "warnings": _code_review_warnings(base, effective, project_rules, dropped_ids, rendered["truncated_paths"],
+                                          unmatched),
+    }
+    return (render_rules_section(kept), rendered["text"]), meta
+
+
+def _render_code_review_bundle(base, bundle_id, sections, meta):
+    rules_text, diff_text = sections
+    truncated = meta["truncated"]
+    parts = ["# Code bundle for rule-based code review", "",
+             "Bundle-ID: %s" % bundle_id, "(copy it into your reply as the line `BUNDLE: %s`)" % bundle_id, "",
+             "Base: origin/%s, changes since the merge base %s. Truncated: %s." % (
+                 base, (meta["merge_base"] or "(no commit yet)")[:12],
+                 "YES (review what is shown and say so in your notes)" if truncated else "no")]
+    if truncated:
+        parts.append("Not fully shown: %s." % ", ".join(meta["truncated_paths"]))
+    parts.extend(["", "## A. Rules (review ONLY against these rules)", "", rules_text.rstrip("\n"), "",
+                  "## B. Files to review", ""])
+    kinds = meta["file_kinds"]
+    parts.extend(["- %s%s" % (path, "  [not shown - bundle size limit]" if kinds.get(path) == "not_shown" else "")
+                  for path in meta["reviewed_paths"]] or ["(none)"])
+    parts.extend(["", "Ignored files (never review or mention them):", ""])
+    parts.extend(["- " + path for path in meta["ignored_paths"]] or ["(none)"])
+    parts.extend(["", "## C. Changes with line numbers",
+                  "(the number is the line in the NEW file; `+` added, `-` removed (no number), ` ` unchanged context)",
+                  "", diff_text.rstrip("\n") or "(none)"])
+    return "\n".join(parts) + "\n"
+
+
+def _pending_review_record(bundle, already_committed, verification):
+    """code_review.json: the verified code review, bound to the bundle's snapshot (base, branch, HEAD, blobs)."""
+    code_review = bundle["code_review"]
+    return {
+        "version": CODE_REVIEW_VERSION, "base": bundle["base"], "branch": bundle["branch"], "head": bundle["head"],
+        "bundle_id": bundle["bundle_id"], "blobs": bundle["blobs"],
+        "complete": verification["complete"], "auto": code_review.get("auto"),
+        "findings": verification["findings"], "blockers": verification["blockers"],
+        "dropped_count": verification["dropped_count"], "already_committed": list(already_committed),
+        "rules_applied": [rule["id"] for rule in code_review["rules"]], "profiles": code_review["profiles"],
+        "project_rules": code_review["project_rules"], "truncated": code_review["truncated"],
+        "truncated_paths": code_review["truncated_paths"], "warnings": code_review["warnings"],
+    }
+
+
+_EMPTY_VERIFICATION = {"complete": True, "findings": [], "blockers": [], "dropped_count": 0}
+
+
+def _write_code_review_bundle(root, base, snapshot, sections, already_committed):
+    """Write <git_dir>/mps-code-review.md, drop any pending code review (it belonged to an older bundle) and, when
+    there is nothing to review against the rules, record the empty review here (no reviewer needed). Returns the
+    output fields of diff-for-review."""
+    meta = snapshot["code_review"]
+    path = os.path.join(git_dir(root), CODE_REVIEW_BUNDLE_FILENAME)
+    with open(path, "wb") as handle:
+        handle.write(_render_code_review_bundle(base, snapshot["bundle_id"], sections, meta).encode("utf-8"))
+    pending = code_review_path(root)
+    _remove_if_exists(pending)
+    if meta["auto"]:
+        _write_json(pending, _pending_review_record(snapshot, already_committed, _EMPTY_VERIFICATION))
+    applied = [rule["id"] for rule in meta["rules"]]
+    return {
+        "code_bundle_path": path,
+        "code_bundle_truncated": meta["truncated"],
+        "code_review_needed": not meta["auto"],
+        "reviewed_files": meta["reviewed_paths"],
+        "ignored_files": meta["ignored_paths"],
+        "rules": {"applied": applied,
+                  "blocker_rule_count": len([r for r in meta["rules"] if r["severity"] == "blocker"]),
+                  "dropped": meta["rules_dropped"], "profiles": meta["profiles"],
+                  "project_rules": meta["project_rules"]},
+        "warnings": meta["warnings"],
+    }
+
+
 def cmd_git_diff_for_review(args):
     root = find_project_root()
+    # The project's blocker rules are read from origin/<base>: a wrong base could read them from a branch without them.
+    ensure_recorded_base_matches(root, current_branch(root), args.base)
     base_ref = "origin/" + args.base
     if not ref_exists(root, "refs/remotes/" + base_ref):
         raise MpsError("base_not_found", "Chưa có %s trên máy. Hãy chạy git prepare-branch trước." % base_ref)
@@ -3133,6 +4507,11 @@ def cmd_git_diff_for_review(args):
     # Snapshot of exactly what the reviewer is shown; `review classify` refuses replies for any other state.
     snapshot = {"bundle_id": uuid.uuid4().hex, "base": args.base, "branch": current_branch(root),
                 "head": head_sha(root), "blobs": file_blobs(root, to_classify)}
+    code_sections = None
+    if args.to_file:
+        # The code reviewer gets the same snapshot: rules, numbered net diff and ranges are stored in bundle.json.
+        code_sections, snapshot["code_review"] = _build_code_review(root, args.base, to_classify, already_committed,
+                                                                    untracked_paths)
     with open(bundle_meta_path(root), "wb") as handle:
         handle.write(json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8"))
     result = {
@@ -3154,6 +4533,7 @@ def cmd_git_diff_for_review(args):
         with open(path, "wb") as handle:
             handle.write(bundle.encode("utf-8"))
         result["bundle_path"] = path
+        result.update(_write_code_review_bundle(root, args.base, snapshot, code_sections, already_committed))
     else:
         result["committed_diff"] = budgeted[0][0]
         result["working_diff"] = budgeted[1][0]
@@ -3273,7 +4653,19 @@ def cmd_git_commit(args):
     targets = expand_rename_sources(requested, status["renames"])
     # The commit may only contain what the scope review approved (or what the user named explicitly), unchanged.
     reviewed = [p for p in targets if p not in sources]
-    check_against_scope(load_scope(root, branch), reviewed, file_blobs(root, reviewed), included)
+    scope = load_scope(root, branch)
+    # Both reviews must have been made against the branch's recorded base (where the project rules are read from).
+    ensure_recorded_base_matches(root, branch, scope.get("base"))
+    check_against_scope(scope, reviewed, file_blobs(root, reviewed), included)
+    # ... and needs a complete code review of the same bundle, without a project blocker in any committed file.
+    # Checked before `git add`, so a refusal never touches the index.
+    code_review = load_code_review(root, branch, scope)
+    blocked = blockers_for_commit(code_review, targets)
+    if blocked:
+        raise MpsError("code_review_blocked", "Thay đổi vi phạm quy tắc bắt buộc của dự án. Chưa commit gì. Hãy sửa theo "
+                                              "quy tắc hoặc nhờ developer review.",
+                       blockers=[dict((key, f[key]) for key in ("rule", "title", "path", "line", "problem",
+                                                                "suggestion")) for f in blocked])
     to_add = [p for p in requested if p not in sources]
     staged_before = set(staged_paths(root))
     if to_add:
@@ -3306,12 +4698,49 @@ def cmd_git_commit(args):
         if "nothing to commit" in text or "no changes added" in text:
             raise MpsError("nothing_to_commit", "Không có thay đổi nào để commit.")
         raise MpsError("commit_failed", "Commit thất bại.", stderr=commit.stderr.strip() or commit.stdout.strip())
-    os.remove(scope_path(root))  # one review approves one commit
     sha = run_git(["rev-parse", "HEAD"], root).stdout.strip()
+    os.remove(scope_path(root))  # one review approves one commit
+    committed_review, recorded = _record_committed_review(root, code_review, sha, targets)
     files = [line for line in run_git(["show", "--name-status", "--format=", "HEAD"], root).stdout.splitlines()
              if line.strip()]
     return {"branch": branch, "commit": sha, "message": message, "attribution_removed": attribution_removed,
-            "files": files, "unstaged_other_files": outside, "left_uncommitted": _changed_paths(git_status(root))}
+            "files": files, "unstaged_other_files": outside, "left_uncommitted": _changed_paths(git_status(root)),
+            "code_review_warning_count": len(code_review_warning_items(committed_review)),
+            "code_review_recorded": recorded}
+
+
+def load_code_review(root, branch, scope):
+    """The pending code review: it must exist, belong to the same branch, HEAD and bundle as the scope review, and be
+    complete. A truncated bundle or invalid project rules never block here (they only change what it found)."""
+    review = _read_json(code_review_path(root))
+    message = ("Chưa có kết quả review code (theo quy tắc của team và dự án) cho đúng lần review hiện tại. Hãy chạy lại "
+               "bước 6 (cả review phạm vi và review code) trước khi commit.")
+    if review is None:
+        raise MpsError("code_review_required", message, reason="missing")
+    if review.get("branch") != branch or review.get("head") != head_sha(root):
+        raise MpsError("code_review_required", message, reason="branch_or_commit_changed")
+    if review.get("bundle_id") != scope.get("bundle_id"):
+        raise MpsError("code_review_required", message, reason="other_bundle")
+    if not review.get("complete"):
+        raise MpsError("code_review_incomplete", "Kết quả review code chưa đầy đủ (có dòng sai định dạng, hoặc một vi phạm "
+                                                 "quy tắc bắt buộc không khớp với thay đổi). Hãy yêu cầu reviewer sửa "
+                                                 "câu trả lời cho cùng bundle rồi chạy lại review findings.",
+                       dropped_count=review.get("dropped_count"))
+    return review
+
+
+def _record_committed_review(root, review, sha, targets):
+    """Move the pending review to committed_review.json (kept for mr ensure, even when step 6 runs again before the
+    merge request). Returns (committed review, written). A failed write never undoes the commit."""
+    committed = dict(review)
+    committed.update({"committed_as": sha,
+                      "committed_paths": sorted(set(targets) | set(review.get("already_committed") or []))})
+    try:
+        _write_json(committed_review_path(root), committed)
+        _remove_if_exists(code_review_path(root))
+    except OSError:
+        return committed, False
+    return committed, True
 
 
 def _already_committed(root, branch, paths):
@@ -3354,6 +4783,40 @@ def cmd_review_classify(args):
     with open(path, "wb") as handle:
         handle.write(json.dumps(scope, ensure_ascii=False, indent=2).encode("utf-8"))
     result["scope_file"] = path
+    return result
+
+
+def cmd_review_findings(args):
+    """Check the code reviewer's FINDINGS: block against the code bundle (rules, files, numbered lines) and save it."""
+    root = find_project_root()
+    pending = code_review_path(root)
+    _remove_if_exists(pending)  # a new code review always replaces the previous one (fail-closed)
+    entries, reply_bundle_id = parse_findings(read_text_arg(None, args.result_file, "kết quả review code"))
+    if entries is None:
+        raise MpsError("code_review_unparsable", "Không đọc được khối FINDINGS: trong kết quả review code. Hãy yêu cầu "
+                                                 "reviewer trả lời đúng định dạng cho cùng bundle rồi chạy lại review "
+                                                 "findings.", result_file=args.result_file)
+    bundle = _read_json(bundle_meta_path(root))
+    uncommitted, committed = review_candidates(root, "origin/" + args.base)
+    reason = stale_bundle_reason(bundle, reply_bundle_id, args.base, current_branch(root), head_sha(root),
+                                 file_blobs(root, uncommitted))
+    if reason is None and "code_review" not in bundle:
+        reason = "no_code_bundle"  # the bundle was made without --to-file
+    if reason:
+        raise MpsError("review_stale", "Kết quả review này không khớp với các thay đổi hiện tại (%s). Hãy chạy lại git "
+                                       "diff-for-review và nhờ reviewer review lại bundle mới." % reason, reason=reason)
+    code_review = bundle["code_review"]
+    verification = verify_findings(entries, code_review, set(uncommitted) | set(committed))
+    _write_json(pending, _pending_review_record(bundle, committed, verification))
+    result = {"bundle_id": bundle["bundle_id"], "complete": verification["complete"],
+              "needs_reviewer_fix": not verification["complete"]}
+    for name in ("findings", "blockers", "rule_warnings", "blockers_in_candidates", "blocked_paths",
+                 "dropped_findings", "dropped_count", "duplicate_count"):
+        result[name] = verification[name]
+    result.update({"rules_applied": [rule["id"] for rule in code_review["rules"]],
+                   "profiles": code_review["profiles"], "project_rules": code_review["project_rules"],
+                   "code_bundle_truncated": code_review["truncated"], "truncated_paths": code_review["truncated_paths"],
+                   "warnings": code_review["warnings"], "auto": code_review.get("auto"), "code_review_file": pending})
     return result
 
 
@@ -3532,6 +4995,59 @@ def _complete_existing_mr(gitlab, project_id, mr, me, label, warnings):
     return mr
 
 
+def _select_committed_review(root, source):
+    """(review, None) when the last committed code review belongs to `source` and its commit is the newest commit of
+    what the MR contains (origin/<source> preferred, as for the MR guard); otherwise (None, reason).
+
+    Requiring the tip is the simplest sound rule: git commit replaces the record after every successful commit, so a
+    record whose commit is not the tip means a later commit has no review of its own (made by hand, or its record
+    could not be written after a crash or write error) and the report would describe older code. A commit that
+    fails (e.g. a hook rejects it) leaves the still-valid record of the previous commit alone.
+    """
+    review = _read_json(committed_review_path(root))
+    if review is None:
+        return None, "no_review"
+    if review.get("branch") != source:
+        return None, "other_branch"
+    sha = review.get("committed_as")
+    source_ref = _source_ref(root, source)
+    if not sha or not run_git(["merge-base", "--is-ancestor", sha, source_ref], root, check=False).ok:
+        return None, "not_in_branch"
+    if run_git(["rev-parse", source_ref], root).stdout.strip() != sha:
+        return None, "outdated"
+    return review, None
+
+
+def _review_note_key(mr, review):
+    return "%s:%s" % (mr.get("iid"), review.get("bundle_id"))
+
+
+def _remember_review_note(root, review, key):
+    """Record that this review is on this MR, so a rerun of mr ensure does not add it again."""
+    review["mr_note"] = key
+    try:
+        _write_json(committed_review_path(root), review)
+    except OSError:
+        pass  # best effort: the report is on the MR; at worst a later rerun adds it once more
+
+
+def _attach_review_note(root, gitlab, project_id, mr, review, section, warnings):
+    """Existing MR: add the report once as a comment. Returns (attached, reason); a failure is only a warning."""
+    key = _review_note_key(mr, review)
+    if review.get("mr_note") == key:
+        return "already", None
+    try:
+        gitlab.request("POST", "/projects/%s/merge_requests/%s/notes" % (project_id, mr.get("iid")),
+                       body={"body": section})
+    except MpsError as exc:
+        warnings.append({"code": "code_review_note_failed", "details": exc.message,
+                         "message": "Không thêm được ghi chú kết quả review code vào merge request đã có (merge request "
+                                    "vẫn bình thường). Có thể chạy lại mr ensure sau."})
+        return "none", "note_failed"
+    _remember_review_note(root, review, key)
+    return "note", None
+
+
 def cmd_mr_ensure(args):
     root = find_project_root()
     cfg = load_config(root)
@@ -3548,6 +5064,12 @@ def cmd_mr_ensure(args):
     plan_phase(phase_of_branch(args.target, branches), args.type, branches)
     # Offline guard first: the MR must go back into the branch the work was based on, with only this ticket's commits.
     ensure_mr_target(root, args.source, args.target, normalize_issue_key(args.key), branches)
+    review, review_reason = (None, None)
+    if args.code_review:
+        review, review_reason = _select_committed_review(root, args.source)
+    # Built by the script from stored data and appended AFTER the attribution strip, which can never remove it.
+    section = render_mr_review_section(review) if review else None
+    attached = "none"
     gitlab = gitlab_client(cfg)
     project = resolve_gitlab_project(cfg, gitlab)
     # Assignee and label are best effort: their failures are warnings and never stop the MR.
@@ -3558,7 +5080,8 @@ def cmd_mr_ensure(args):
     mr = None
     if existing is None:
         body = {"source_branch": args.source, "target_branch": args.target, "title": title,
-                "description": description, "remove_source_branch": True}
+                "description": description if section is None else description + "\n\n" + section,
+                "remove_source_branch": True}
         extras = {}
         if me:
             extras["assignee_ids"] = [me["id"]]
@@ -3567,6 +5090,9 @@ def cmd_mr_ensure(args):
         resp = _create_mr(gitlab, project["id"], body, extras, label, warnings)
         if resp.status in (200, 201):
             mr = resp.data
+            if section is not None:
+                attached = "description"
+                _remember_review_note(root, review, _review_note_key(mr, review))
         else:
             # GitLab answers 409 or 422 when an open MR for the branch appeared meanwhile: reuse that one.
             existing = _find_open_mr(gitlab, project["id"], args.source) if resp.status in (409, 422) else None
@@ -3581,9 +5107,16 @@ def cmd_mr_ensure(args):
                            % (args.source, existing.get("target_branch"), args.target),
                            existing_mr=_mr_summary(existing, True), expected_target=args.target)
         mr = _complete_existing_mr(gitlab, project["id"], existing, me, label, warnings)
+        if section is not None:
+            attached, review_reason = _attach_review_note(root, gitlab, project["id"], mr, review, section, warnings)
     result = _mr_summary(mr, existing is not None)
     result.update({"assignees": mr_assignee_usernames(mr), "labels": list(mr.get("labels") or []),
                    "warnings": warnings, "attribution_removed": title_stripped or description_stripped})
+    if args.code_review:
+        result["code_review_attached"] = attached
+        result["code_review_warning_count"] = len(code_review_warning_items(review)) if attached != "none" else 0
+        if attached == "none":
+            result["code_review_reason"] = review_reason
     return result
 
 
@@ -3625,6 +5158,8 @@ def build_parser():
 
     project = _subcommands(groups.add_parser("project", help="plugin integration for the project (lead)"), "command")
     p = project.add_parser("setup", help="add the plugin (auto-update on) to .claude/settings.json, git-ignore .env")
+    p.add_argument("--review-rules", action="store_true",
+                   help="also create %s from the template when the project has none" % PROJECT_RULES_PATH)
     p.set_defaults(handler=cmd_project_setup)
 
     jira = _subcommands(groups.add_parser("jira", help="Jira tickets"), "command")
@@ -3684,9 +5219,10 @@ def build_parser():
     p.add_argument("--name", required=True)
     p.add_argument("--email", required=True)
     p.set_defaults(handler=cmd_git_set_identity)
-    p = git.add_parser("diff-for-review", help="changes vs origin/BASE for the scope reviewer")
+    p = git.add_parser("diff-for-review", help="changes vs origin/BASE for the scope reviewer and the code reviewer")
     p.add_argument("--base", required=True)
-    p.add_argument("--to-file", action="store_true", help="write the bundle to <git-dir>/%s" % REVIEW_BUNDLE_FILENAME)
+    p.add_argument("--to-file", action="store_true", help="write the bundles to <git-dir>/%s and <git-dir>/%s" % (
+        REVIEW_BUNDLE_FILENAME, CODE_REVIEW_BUNDLE_FILENAME))
     p.set_defaults(handler=cmd_git_diff_for_review)
     p = git.add_parser("commit", help="commit exactly the listed files (no folders, no 'everything' mode)")
     p.add_argument("--message", required=True)
@@ -3707,13 +5243,19 @@ def build_parser():
     p.add_argument("--description", required=True)
     p.add_argument("--key", required=True, help="Jira key; every commit in origin/TARGET..SOURCE must mention it")
     p.add_argument("--type", required=True, choices=TICKET_TYPES, help="ticket type; checked against the target's phase")
+    p.add_argument("--code-review", action="store_true",
+                   help="add the report of the last committed code review (new MR: description; existing MR: one note)")
     p.set_defaults(handler=cmd_mr_ensure)
 
-    review = _subcommands(groups.add_parser("review", help="scope review result"), "command")
+    review = _subcommands(groups.add_parser("review", help="scope review and code review results"), "command")
     p = review.add_parser("classify", help="check the reviewer's FILES: block, derive commit / exclude lists")
     p.add_argument("--base", required=True)
     p.add_argument("--result-file", required=True, help="file with the reviewer's full reply (in tmp_dir)")
     p.set_defaults(handler=cmd_review_classify)
+    p = review.add_parser("findings", help="check the code reviewer's FINDINGS: block against the code bundle")
+    p.add_argument("--base", required=True)
+    p.add_argument("--result-file", required=True, help="file with the code reviewer's full reply (in tmp_dir)")
+    p.set_defaults(handler=cmd_review_findings)
     return parser
 
 

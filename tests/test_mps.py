@@ -661,14 +661,17 @@ class FakeMrGitLab(object):
 
     reject_extras: the POST is refused (400) while it carries assignee_ids or labels.
     race_status: another open MR for the branch appears just before the POST, which GitLab refuses with this status.
+    notes_status: the HTTP status GitLab answers to a new MR note (comment).
     """
 
-    def __init__(self, labels=("Enhancement", "Bug"), mrs=(), reject_extras=False, race_status=None):
+    def __init__(self, labels=("Enhancement", "Bug"), mrs=(), reject_extras=False, race_status=None, notes_status=201):
         self.user = {"id": 7, "username": "hung"}
         self.labels = [{"name": name} for name in labels]
         self.mrs = [dict(mr) for mr in mrs]
         self.reject_extras = reject_extras
         self.race_status = race_status
+        self.notes_status = notes_status
+        self.notes = []
         self.calls = []
 
     def respond(self, status, data):
@@ -704,6 +707,11 @@ class FakeMrGitLab(object):
                   "assignees": [self.user] if body.get("assignee_ids") == [self.user["id"]] else []}
             self.mrs.append(mr)
             return self.respond(201, mr)
+        if method == "POST" and path.startswith("/projects/1/merge_requests/") and path.endswith("/notes"):
+            if self.notes_status >= 400 and self.notes_status not in allow_statuses:
+                raise mps.MpsError("server_error", "fake %d" % self.notes_status, status=self.notes_status)
+            self.notes.append((path, body["body"]))
+            return self.respond(self.notes_status, {"id": len(self.notes)})
         if method == "PUT" and path.startswith("/projects/1/merge_requests/"):
             mr = self.find_mr(path)
             if "assignee_ids" in body:
@@ -851,10 +859,33 @@ class GitFlowTests(unittest.TestCase):
     def classify(self, reply, base="develop"):
         return self.mps("review", "classify", "--base=" + base, "--result-file=" + reply)
 
-    def approve(self, in_scope, base="develop", **reply_args):
+    def approve_scope_only(self, in_scope, base="develop", **reply_args):
         """diff-for-review, a reviewer reply for that bundle, then `review classify` (writes scope.json)."""
         bundle_id = self.make_bundle(base)
         return self.classify(self.write_reply(bundle_id, in_scope, **reply_args), base)
+
+    def approve(self, in_scope, base="develop", code_findings=(), **reply_args):
+        """Both reviews of one bundle: the scope review (returns its classify result) and a code review with
+        `code_findings` (`FINDINGS: none` by default)."""
+        bundle_id = self.make_bundle(base)
+        result = self.classify(self.write_reply(bundle_id, in_scope, **reply_args), base)
+        self.review_code(bundle_id, code_findings, base)
+        return result
+
+    def write_code_reply(self, bundle_id, findings=(), name="code_review"):
+        """A code reviewer's reply: `FINDINGS: none` (or the finding lines), then `BUNDLE:` (None leaves it out)."""
+        lines = ["### Kết quả review code", "", "FINDINGS:" if findings else "FINDINGS: none"] + list(findings)
+        if bundle_id:
+            lines.append("BUNDLE: " + bundle_id)
+        reply = os.path.join(mps.mps_tmp_dir(self.repo), name + ".txt")
+        with open(reply, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        return reply
+
+    def review_code(self, bundle_id, findings=(), base="develop"):
+        """`review findings` for a code reviewer reply (writes code_review.json)."""
+        reply = self.write_code_reply(bundle_id, findings)
+        return self.mps("review", "findings", "--base=" + base, "--result-file=" + reply)
 
     def commit(self, message, *files):
         return self.mps("git", "commit", "--message=" + message, "--files", *files)
@@ -1068,6 +1099,7 @@ class GitFlowTests(unittest.TestCase):
         classified = self.classify(reply)
         self.assertTrue(classified["complete"])
         self.assertEqual(classified["commit_files"], ["src/login.cs"])
+        self.review_code(review["bundle_id"])
         # M1: an excluded file cannot slip into the commit just by being listed.
         sneaky = self.commit("feat: MPS-6 Login", "src/login.cs", "ProjectSettings/ProjectSettings.asset")
         self.assertEqual((sneaky["error"], sneaky["files"]), ("not_in_scope", ["ProjectSettings/ProjectSettings.asset"]))
@@ -1077,6 +1109,8 @@ class GitFlowTests(unittest.TestCase):
         self.assertIn("unity import", self.read("app.txt"))
         self.assertNotIn("mps-tmp", self.git("status", "--porcelain", "-uall"))
         self.assertFalse(os.path.exists(mps.scope_path(self.repo)))  # one review approves one commit
+        self.assertFalse(os.path.exists(mps.code_review_path(self.repo)))
+        self.assertEqual(mps._read_json(mps.committed_review_path(self.repo))["committed_as"], self.head())
 
     # -- R3: recorded base, base_mismatch, MR guard, phase detection --------
 
@@ -1230,6 +1264,9 @@ class GitFlowTests(unittest.TestCase):
                         "--include-out-of-scope", "b.txt")
         self.assertEqual(sorted(done["files"]), ["A\ta.txt", "A\tb.txt"])
         self.assertFalse(os.path.exists(mps.scope_path(self.repo)))
+        self.assertFalse(os.path.exists(mps.code_review_path(self.repo)))
+        committed = mps._read_json(mps.committed_review_path(self.repo))
+        self.assertEqual((committed["committed_as"], committed["committed_paths"]), (self.head(), ["a.txt", "b.txt"]))
 
     def test_mixed_and_needs_decision_require_explicit_choice(self):
         self.prepare("feature/MPS-15-a", "MPS-15")
@@ -1292,6 +1329,7 @@ class GitFlowTests(unittest.TestCase):
                           "--include-out-of-scope", "b.txt")
         self.assertEqual(forced["error"], "scope_incomplete")
         self.assertTrue(self.classify(self.write_reply(new_bundle, ["a.txt"], out_of_scope=["b.txt"]))["complete"])
+        self.review_code(new_bundle)
         self.assertTrue(self.commit("feat: MPS-18 a", "a.txt")["ok"])
 
     def test_squash_merged_branch_is_not_unpushed_work(self):
@@ -1559,6 +1597,21 @@ class GitFlowTests(unittest.TestCase):
         self.assertNotIn("plugin_outdated", codes)
         self.assertNotIn("project_not_integrated", codes)
 
+    def test_project_setup_scaffolds_review_rules_on_request(self):
+        """0.2.0 hook point (R.4): review_rules is reported; --review-rules creates the file, never overwrites it."""
+        first = self.mps("project", "setup")
+        self.assertEqual((first["review_rules"], first["review_rules_problems"]), ("absent", []))
+        self.assertNotIn(".mps/review.md", first["files_to_commit"])
+        created = self.mps("project", "setup", "--review-rules")
+        self.assertEqual(created["review_rules"], "created")
+        self.assertEqual(created["files_to_commit"], [".claude/settings.json", ".gitignore", ".mps/review.md"])
+        self.assertEqual(_read_bytes(created["review_rules_path"]), _read_bytes(mps.REVIEW_RULES_TEMPLATE_PATH))
+        self.write(".mps/review.md", "## BAD [oops] x\n")
+        present = self.mps("project", "setup", "--review-rules")
+        self.assertEqual((present["review_rules"], [p["line"] for p in present["review_rules_problems"]]),
+                         ("present", [1]))
+        self.assertEqual(self.read(".mps/review.md"), "## BAD [oops] x\n")
+
     def test_project_setup_warns_when_settings_are_ignored(self):
         """P3."""
         self.write(".gitignore", ".claude/\n")
@@ -1647,10 +1700,12 @@ class GitFlowTests(unittest.TestCase):
         self.mps("git", "push", "--branch=" + branch, "--base=develop")
         return branch
 
-    def ensure_mr(self, gitlab, branch, key, kind="story", description=None):
+    def ensure_mr(self, gitlab, branch, key, kind="story", description=None, code_review=False):
+        extra = ["--code-review"] if code_review else []
         with mock.patch.object(mps, "gitlab_client", return_value=gitlab):
             return self.mps("mr", "ensure", "--source=" + branch, "--target=develop", "--title=%s a" % key,
-                            "--description=" + (description or "Close " + key), "--key=" + key, "--type=" + kind)
+                            "--description=" + (description or "Close " + key), "--key=" + key, "--type=" + kind,
+                            *extra)
 
     def test_mr_created_with_assignee_and_label(self):
         branch = self.pushed_ticket_branch("MPS-40")
@@ -1735,6 +1790,395 @@ class GitFlowTests(unittest.TestCase):
         self.assertTrue(result["attribution_removed"])
         self.assertEqual(gitlab.bodies("POST")[0]["description"], "Close MPS-45\n" + human)
 
+    # -- 0.2.0: code review ------------------------------------------------------
+
+    def golden_scope_bundle(self):
+        """R1 fixture: committed + working + untracked + .env.local changes; the scope bundle with its id masked."""
+        self.prepare("feature/MPS-60-golden", "MPS-60")
+        self.write("src/a.txt", "a1\na2\n")
+        self.git("add", "src/a.txt")
+        self.git("commit", "-q", "-m", "feat: MPS-60 a")
+        self.write("app.txt", "line1\nline2 edited\n")
+        self.write("new.txt", "brand new\n")
+        self.write("cfg/.env.local", "SECRET_VALUE_XYZ=1\n")
+        review = self.mps("git", "diff-for-review", "--base=develop", "--to-file")
+        with open(review["bundle_path"], "rb") as handle:
+            text = handle.read().decode("utf-8")
+        return text.replace(review["bundle_id"], "<BUNDLE-ID>")
+
+    def test_scope_bundle_is_unchanged(self):
+        """R1: the scope bundle stays byte-identical; bundle.json without --to-file has no code_review key."""
+        self.assertEqual(self.golden_scope_bundle(), GOLDEN_SCOPE_BUNDLE)
+        self.mps("git", "diff-for-review", "--base=develop")
+        self.assertNotIn("code_review", mps._read_json(mps.bundle_meta_path(self.repo)))
+
+    def bundle(self, base="develop"):
+        return self.mps("git", "diff-for-review", "--base=" + base, "--to-file")
+
+    def code_bundle_text(self, review):
+        with open(review["code_bundle_path"], encoding="utf-8") as handle:
+            return handle.read()
+
+    def push_project_rules(self, text, branch="develop"):
+        """Commit .mps/review.md on origin/<branch> (from the second clone) and fetch it."""
+        self.push_upstream(branch, ".mps/review.md", text, "chore: review rules")
+        self.git("fetch", "-q")
+
+    def test_code_bundle_without_project_rules(self):
+        """I3."""
+        self.prepare("feature/MPS-61-a", "MPS-61")
+        self.write("a.txt", "a\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-q", "-m", "feat: MPS-61 a")
+        self.write("app.txt", "line1\nline2 edited\nline3\n")
+        self.write(".env.local", "SECRET_VALUE_XYZ=1\n")
+        review = self.bundle()
+        self.assertEqual((review["rules"]["project_rules"]["status"], review["code_review_needed"]), ("absent", True))
+        self.assertIn("BASE-HARDCODED-SECRET", review["rules"]["applied"])
+        self.assertEqual((review["reviewed_files"], review["ignored_files"], review["warnings"]),
+                         (["a.txt", "app.txt"], [], []))
+        text = self.code_bundle_text(review)
+        self.assertIn("Bundle-ID: " + review["bundle_id"], text)
+        self.assertIn("### a.txt  [added]\n@@ -0,0 +1 @@\n     1 + a\n", text)
+        self.assertIn("     2 + line2 edited\n     3 + line3\n", text)
+        self.assertNotIn("SECRET_VALUE_XYZ", text)
+        code_review = mps._read_json(mps.bundle_meta_path(self.repo))["code_review"]
+        self.assertEqual(code_review["ranges"], {"a.txt": [[1, 1]], "app.txt": [[1, 3]]})
+        self.assertFalse(os.path.exists(mps.code_review_path(self.repo)))
+
+    def test_project_rules_come_from_the_base_branch(self):
+        """I2 (bundle part): a local edit of .mps/review.md changes nothing until it is merged."""
+        self.push_project_rules(PROJECT_RULES)
+        self.prepare("feature/MPS-62-a", "MPS-62")
+        self.write(".mps/review.md", "---\nversion: 1\n---\n")
+        self.write("a.txt", "a\n")
+        review = self.bundle()
+        rules = review["rules"]
+        self.assertIn("SH-NO-PRINT", rules["applied"])
+        self.assertEqual((rules["blocker_rule_count"], rules["project_rules"]["status"],
+                          rules["project_rules"]["pending_change"], rules["project_rules"]["source"]),
+                         (1, "applied", True, "origin/develop:.mps/review.md"))
+        self.assertEqual([w["code"] for w in review["warnings"]], ["project_rules_pending"])
+        self.assertIn("### SH-NO-PRINT [blocker]", self.code_bundle_text(review))
+        self.approve([".mps/review.md", "a.txt"], code_findings=["SH-NO-PRINT | blocker | a.txt:1 | p | s"])
+        self.assertEqual(self.commit("feat: MPS-62 a", ".mps/review.md", "a.txt")["error"], "code_review_blocked")
+
+    def test_invalid_project_rules_warn_and_continue(self):
+        """I6 (bundle part)."""
+        self.push_project_rules(PROJECT_RULES.replace("[blocker]", "[fatal]") + "\n## SH-OK [major] ok\n")
+        self.prepare("feature/MPS-63-a", "MPS-63")
+        self.write("a.txt", "a\n")
+        review = self.bundle()
+        project = review["rules"]["project_rules"]
+        self.assertEqual((project["status"], [p["line"] for p in project["problems"]]), ("invalid", [5]))
+        warning = review["warnings"][0]
+        self.assertEqual((warning["code"], warning["problems"]), ("project_rules_invalid", project["problems"]))
+        self.assertIn("KHÔNG được áp dụng", warning["message"])
+        self.assertNotIn("SH-OK", review["rules"]["applied"])
+        text = self.code_bundle_text(review)
+        self.assertNotIn("SH-OK", text)
+        self.assertNotIn("SH-NO-PRINT", text)
+        self.assertTrue(review["code_review_needed"])
+        # A finding citing a rule of the broken file is dropped without making the review incomplete (the reviewer
+        # never sees a blocker rule then); had the reviewer called it a blocker, it would have to fix its reply.
+        self.classify(self.write_reply(review["bundle_id"], ["a.txt"]))
+        claimed = self.review_code(review["bundle_id"], ["SH-NO-PRINT | blocker | a.txt:1 | p | s"])
+        self.assertEqual((claimed["complete"], claimed["dropped_findings"][0]["blocker_claimed"]), (False, True))
+        findings = self.review_code(review["bundle_id"], ["SH-NO-PRINT | major | a.txt:1 | p | s"])
+        self.assertEqual((findings["complete"], findings["dropped_findings"][0]["reason"],
+                          findings["dropped_findings"][0]["blocker_rule"]), (True, "unknown_rule", False))
+        self.assertEqual(findings["warnings"][0]["code"], "project_rules_invalid")
+        self.assertTrue(self.commit("feat: MPS-63 a", "a.txt")["ok"])
+        section = mps.render_mr_review_section(mps._read_json(mps.committed_review_path(self.repo)))
+        self.assertIn("Quy tắc riêng của dự án KHÔNG được áp dụng", section)
+        self.assertIn("dòng 5:", section)
+
+    def test_unity_profile_in_a_subfolder(self):
+        """I7 (bundle part)."""
+        self.make_unity_project("Game")
+        self.prepare("feature/MPS-64-a", "MPS-64")
+        self.write("Game/Assets/Main.prefab", "prefab: yaml\n")
+        self.write("Game/Assets/X.cs", "class X {}\n")
+        self.write("Tools/X.cs", "class T {}\n")
+        review = self.bundle()
+        self.assertEqual(review["rules"]["profiles"], [{"name": "unity-csharp", "roots": ["Game"],
+                                                        "source": "detected"}])
+        self.assertEqual((review["reviewed_files"], review["ignored_files"]),
+                         (["Game/Assets/X.cs", "Tools/X.cs"], ["Game/Assets/Main.prefab"]))
+        self.assertIn("UNITY-NO-FIND-IN-UPDATE", review["rules"]["applied"])
+        text = self.code_bundle_text(review)
+        self.assertIn("Applies to: `**/*.cs` (relative to `Game`)", text)
+        self.assertNotIn("prefab: yaml", text)
+
+    def test_nothing_to_review_records_an_empty_review(self):
+        """I11 (bundle part): an artist-only change needs no code reviewer."""
+        self.make_unity_project("Game")
+        self.prepare("feature/MPS-65-a", "MPS-65")
+        self.write("Game/Assets/Main.prefab", "prefab: yaml\n")
+        review = self.bundle()
+        self.assertEqual((review["code_review_needed"], review["reviewed_files"], review["rules"]["applied"]),
+                         (False, [], []))
+        record = mps._read_json(mps.code_review_path(self.repo))
+        self.assertEqual((record["auto"], record["complete"], record["bundle_id"], record["findings"]),
+                         ("nothing_to_review", True, review["bundle_id"], []))
+        self.approve_scope_only(["Game/Assets/Main.prefab"])
+        done = self.commit("feat: MPS-65 a", "Game/Assets/Main.prefab")
+        self.assertEqual((done["ok"], done["code_review_warning_count"]), (True, 0))
+
+    def test_project_rule_beats_profile_ignore_and_unmatched_rules_warn(self):
+        """M1: a prefab-only change under an L3 prefab blocker is reviewed (no auto shortcut); an L3 rule whose
+        root-anchored paths miss the Unity subfolder is reported."""
+        self.write("Game/ProjectSettings/ProjectVersion.txt", "m_EditorVersion: 2022.3.0f1\n")
+        self.write("Game/Assets/Old.prefab", "old: yaml\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "chore: unity project")
+        self.git("push", "-q", "origin", "HEAD")
+        self.push_project_rules("\n".join([
+            "## SH-PREFAB [blocker] Prefab phải có tên tiếng Anh", "paths: **/*.prefab", "",
+            "## SH-WRONG [blocker] Sai gốc đường dẫn", "paths: Assets/Scripts/**/*.cs", ""]))
+        self.prepare("feature/MPS-74-a", "MPS-74")
+        self.write("Game/Assets/Main.prefab", "prefab: yaml\n")
+        review = self.bundle()
+        self.assertEqual((review["code_review_needed"], review["reviewed_files"], review["ignored_files"]),
+                         (True, ["Game/Assets/Main.prefab"], []))
+        self.assertIn("SH-PREFAB", review["rules"]["applied"])
+        self.assertEqual([(w["code"], w["rule"]) for w in review["warnings"]],
+                         [("project_rule_matches_nothing", "SH-WRONG")])
+        self.assertFalse(os.path.exists(mps.code_review_path(self.repo)))  # no auto "nothing to review" record
+        self.approve(["Game/Assets/Main.prefab"],
+                     code_findings=["SH-PREFAB | blocker | Game/Assets/Main.prefab:1 | p | s"])
+        self.assertEqual(self.commit("feat: MPS-74 a", "Game/Assets/Main.prefab")["error"], "code_review_blocked")
+        # project setup checks the local copy against the tracked files.
+        setup = self.mps("project", "setup")
+        self.assertEqual([(w["code"], w["rule"]) for w in setup["warnings"]],
+                         [("project_rule_matches_nothing", "SH-WRONG")])
+
+    def test_rule_for_a_folder_this_change_adds_does_not_warn(self):
+        """m-c: base files plus the changed paths are searched; a project ignore hiding a rule's files warns (m-b)."""
+        self.push_project_rules("\n".join([
+            "---", "ignore: Docs/**", "---",
+            "## SH-NEW [major] Công cụ mới", "paths: Tools/New/**", "",
+            "## SH-DOCS [blocker] Tài liệu", "paths: Docs/**", ""]))
+        self.prepare("feature/MPS-77-a", "MPS-77")
+        self.write("other.txt", "x\n")
+        before = self.bundle()
+        self.assertEqual(sorted(w["rule"] for w in before["warnings"] if w["code"] == "project_rule_matches_nothing"),
+                         ["SH-DOCS", "SH-NEW"])
+        self.write("Tools/New/a.txt", "new tool\n")
+        self.write("Docs/guide.md", "guide\n")
+        after = self.bundle()
+        self.assertEqual([w["rule"] for w in after["warnings"] if w["code"] == "project_rule_matches_nothing"],
+                         ["SH-DOCS"])
+        self.assertIn("Docs/guide.md", after["ignored_files"])
+
+    def test_reviews_must_use_the_recorded_base(self):
+        """M2: the project rules come from origin/<base>, so a different base than the recorded one is refused."""
+        self.prepare("feature/MPS-75-a", "MPS-75")
+        self.write("a.txt", "a\n")
+        refused = self.mps("git", "diff-for-review", "--base=release/1.0", "--to-file")
+        self.assertEqual((refused["error"], refused["recorded_base"]), ("base_mismatch", "develop"))
+        # Reviews made against another base (no record at that time) cannot be used once the base is recorded.
+        self.git("config", "--unset", "branch.feature/MPS-75-a.mps-base")
+        self.approve(["a.txt", "feature.txt"], base="release/1.0")
+        self.git("config", "branch.feature/MPS-75-a.mps-base", "develop")
+        before = self.head()
+        self.assertEqual(self.commit("feat: MPS-75 a", "a.txt")["error"], "base_mismatch")
+        self.assertEqual(self.head(), before)
+
+    def test_mr_never_gets_an_outdated_review(self):
+        """m1: a commit without its own record (write failed, or made by hand) never shows an older commit's report;
+        a commit that fails keeps the previous, still valid record (m-a)."""
+        branch = self.pushed_ticket_branch("MPS-76")
+        with open(mps.committed_review_path(self.repo), "rb") as handle:
+            record_a = handle.read()
+        self.write("b.txt", "b\n")
+        self.approve(["a.txt", "b.txt"])
+        hook = os.path.join(self.repo, ".git", "hooks", "pre-commit")
+        with open(hook, "w", newline="\n") as handle:
+            handle.write("#!/bin/sh\nexit 1\n")
+        os.chmod(hook, 0o755)
+        self.assertEqual(self.commit("feat: MPS-76 b", "b.txt")["error"], "commit_failed")
+        os.remove(hook)
+        with open(mps.committed_review_path(self.repo), "rb") as handle:
+            self.assertEqual(handle.read(), record_a)  # the rejected commit did not destroy A's record
+        self.git("reset", "-q")  # the failed attempt left b.txt staged
+        with mock.patch.object(mps, "_write_json", side_effect=OSError("disk full")):
+            failed = self.commit("feat: MPS-76 b", "b.txt")
+        self.assertEqual((failed["ok"], failed["code_review_recorded"]), (True, False))
+        self.mps("git", "push", "--branch=" + branch, "--base=develop")
+        gitlab = FakeMrGitLab()
+        stale = self.ensure_mr(gitlab, branch, "MPS-76", code_review=True)
+        self.assertEqual((stale["code_review_attached"], stale["code_review_reason"]), ("none", "outdated"))
+        self.commit_and_push(branch, "MPS-76", "c.txt")
+        self.git("commit", "-q", "--allow-empty", "-m", "feat: MPS-76 by hand")
+        self.mps("git", "push", "--branch=" + branch, "--base=develop")
+        outdated = self.ensure_mr(gitlab, branch, "MPS-76", code_review=True)
+        self.assertEqual((outdated["code_review_attached"], outdated["code_review_reason"]), ("none", "outdated"))
+
+    def test_commit_requires_a_code_review_of_the_same_bundle(self):
+        """I1."""
+        self.prepare("feature/MPS-67-a", "MPS-67")
+        self.write("a.txt", "a\n")
+        self.approve_scope_only(["a.txt"])
+        missing = self.commit("feat: MPS-67 a", "a.txt")
+        self.assertEqual((missing["error"], missing["reason"]), ("code_review_required", "missing"))
+        bundle_a = self.make_bundle()
+        self.review_code(bundle_a)
+        with open(mps.code_review_path(self.repo), "rb") as handle:
+            review_a = handle.read()
+        self.approve_scope_only(["a.txt"])  # bundle B (it drops the pending review of A) ...
+        with open(mps.code_review_path(self.repo), "wb") as handle:
+            handle.write(review_a)  # ... even if A's review were put back, it does not count for B
+        other = self.commit("feat: MPS-67 a", "a.txt")
+        self.assertEqual((other["error"], other["reason"]), ("code_review_required", "other_bundle"))
+        self.approve(["a.txt"])
+        record = mps._read_json(mps.code_review_path(self.repo))
+        mps._write_json(mps.code_review_path(self.repo), dict(record, head="0" * 40))
+        moved = self.commit("feat: MPS-67 a", "a.txt")
+        self.assertEqual((moved["error"], moved["reason"]), ("code_review_required", "branch_or_commit_changed"))
+        bundle_id = self.make_bundle()
+        self.classify(self.write_reply(bundle_id, ["a.txt"]))
+        self.review_code(bundle_id, ["BASE-NEW-TODO | minor | a.txt:1 | p"])  # a malformed line
+        self.assertEqual(self.commit("feat: MPS-67 a", "a.txt")["error"], "code_review_incomplete")
+        self.assertEqual(self.git("diff", "--cached", "--name-only").strip(), "")
+
+    def test_project_blocker_stops_the_commit_until_fixed(self):
+        """I4: the Q1 path - nothing is staged; after a fix and two fresh reviews the commit goes through."""
+        self.push_project_rules(PROJECT_RULES)
+        self.prepare("feature/MPS-68-a", "MPS-68")
+        self.write("a.txt", "print('debug')\n")
+        before = self.head()
+        self.approve(["a.txt"], code_findings=["SH-NO-PRINT | blocker | a.txt:1 | In ra console | Xoá dòng print"])
+        blocked = self.commit("feat: MPS-68 a", "a.txt")
+        self.assertEqual(blocked["error"], "code_review_blocked")
+        self.assertEqual(blocked["blockers"], [{"rule": "SH-NO-PRINT", "title": "Không để lệnh print trong file",
+                                                "path": "a.txt", "line": "1", "problem": "In ra console",
+                                                "suggestion": "Xoá dòng print"}])
+        self.assertEqual(self.head(), before)
+        self.assertEqual(self.git("diff", "--cached", "--name-only").strip(), "")
+        self.assertTrue(os.path.exists(mps.code_review_path(self.repo)))
+        self.write("a.txt", "fixed\n")
+        self.assertEqual(self.commit("feat: MPS-68 a", "a.txt")["error"], "changed_since_review")
+        self.approve(["a.txt"])
+        done = self.commit("feat: MPS-68 a", "a.txt")
+        self.assertEqual((done["ok"], done["code_review_warning_count"], done["code_review_recorded"]), (True, 0, True))
+
+    def test_warnings_never_block(self):
+        """I5: severity comes from the rule; the review moves to committed_review.json."""
+        self.prepare("feature/MPS-69-a", "MPS-69")
+        self.write("a.txt", "a\n")
+        self.approve(["a.txt"], code_findings=["BASE-DEBUG-LEFTOVER | major | a.txt:1 | p | s"])
+        done = self.commit("feat: MPS-69 a", "a.txt")
+        self.assertEqual((done["ok"], done["code_review_warning_count"]), (True, 1))
+        committed = mps._read_json(mps.committed_review_path(self.repo))
+        self.assertEqual((committed["committed_as"], committed["findings"][0]["severity"],
+                          committed["findings"][0]["severity_corrected"]), (self.head(), "minor", True))
+        self.assertFalse(os.path.exists(mps.code_review_path(self.repo)))
+
+    def test_blocker_in_an_excluded_file(self):
+        """I8: it does not stop the other files, and the file cannot be force-included."""
+        self.push_project_rules(PROJECT_RULES)
+        self.prepare("feature/MPS-71-a", "MPS-71")
+        self.write("a.txt", "a\n")
+        self.write("b.txt", "print('x')\n")
+        blocker = ["SH-NO-PRINT | blocker | b.txt:1 | p | s"]
+        self.approve(["a.txt"], out_of_scope=["b.txt"], code_findings=blocker)
+        self.assertTrue(self.commit("feat: MPS-71 a", "a.txt")["ok"])
+        self.approve(["a.txt"], out_of_scope=["b.txt"], code_findings=blocker)  # a.txt: already committed
+        forced = self.mps("git", "commit", "--message=feat: MPS-71 b", "--files", "b.txt",
+                          "--include-out-of-scope", "b.txt")
+        self.assertEqual((forced["error"], forced["blockers"][0]["path"]), ("code_review_blocked", "b.txt"))
+
+    def test_review_findings_end_to_end(self):
+        """Checkpoint 2 + I10: findings are matched against the real bundle; a non-ASCII path is accepted."""
+        self.push_project_rules(PROJECT_RULES)
+        self.prepare("feature/MPS-66-a", "MPS-66")
+        self.write("a.txt", "print('x')\n")
+        self.write("Assets/Tiếng Việt/Chào.cs", "class C {}\n")
+        self.assertEqual(self.review_code("0" * 32)["reason"], "no_bundle")
+        bundle_id = self.bundle()["bundle_id"]
+        result = self.review_code(bundle_id, ["SH-NO-PRINT | blocker | a.txt:1 | In ra console | Xoá dòng print",
+                                              "BASE-DEBUG-LEFTOVER | minor | Assets/Tiếng Việt/Chào.cs:1 | p | s",
+                                              "BASE-NOPE | major | a.txt:1 | p | s"])
+        self.assertEqual((result["complete"], result["needs_reviewer_fix"], result["dropped_count"]), (True, False, 1))
+        self.assertEqual([(f["rule"], f["path"]) for f in result["blockers_in_candidates"]], [("SH-NO-PRINT", "a.txt")])
+        self.assertEqual([f["path"] for f in result["rule_warnings"]], ["Assets/Tiếng Việt/Chào.cs"])
+        self.assertEqual(result["dropped_findings"][0]["reason"], "unknown_rule")
+        record = mps._read_json(mps.code_review_path(self.repo))
+        self.assertEqual((record["bundle_id"], record["complete"], len(record["blockers"])), (bundle_id, True, 1))
+        # Fail-closed: an unparsable reply or a bundle without the code review removes the pending record.
+        unparsable = self.mps("review", "findings", "--base=develop",
+                              "--result-file=" + self.write_reply(bundle_id, ["a.txt"]))
+        self.assertEqual(unparsable["error"], "code_review_unparsable")
+        self.assertFalse(os.path.exists(mps.code_review_path(self.repo)))
+        plain = self.mps("git", "diff-for-review", "--base=develop")["bundle_id"]
+        self.assertEqual(self.review_code(plain)["reason"], "no_code_bundle")
+        bundle_id = self.bundle()["bundle_id"]
+        self.write("a.txt", "print('x')\nprint('y')\n")
+        self.assertEqual(self.review_code(bundle_id)["reason"], "files_changed")
+
+    def commit_and_push(self, branch, key, path, findings=()):
+        """Write `path`, review both ways (every earlier file of the branch is already committed), commit, push."""
+        self.write(path, "%s %s\n" % (path, key))
+        committed = [p for p in self.git("diff", "--name-only", "origin/develop...HEAD").split() if p != path]
+        self.approve(committed + [path], code_findings=findings)
+        self.assertTrue(self.commit("feat: %s %s" % (key, path), path)["ok"])
+        self.mps("git", "push", "--branch=" + branch, "--base=develop")
+
+    def test_mr_gets_the_code_review_report(self):
+        """I9: new MR -> description; existing MR -> one note per committed review; failures are warnings."""
+        branch = self.pushed_ticket_branch("MPS-72")
+        gitlab = FakeMrGitLab()
+        created = self.ensure_mr(gitlab, branch, "MPS-72", code_review=True)
+        self.assertEqual((created["existed"], created["code_review_attached"], created["code_review_warning_count"]),
+                         (False, "description", 0))
+        description = gitlab.bodies("POST")[0]["description"]
+        self.assertTrue(description.startswith("Close MPS-72\n\n### Kết quả review code tự động\n"), description)
+        review = mps._read_json(mps.committed_review_path(self.repo))
+        self.assertEqual(review["mr_note"], "1:" + review["bundle_id"])
+        again = self.ensure_mr(gitlab, branch, "MPS-72", code_review=True)
+        self.assertEqual((again["existed"], again["code_review_attached"], gitlab.notes), (True, "already", []))
+        self.commit_and_push(branch, "MPS-72", "b.txt", ["BASE-DEBUG-LEFTOVER | minor | b.txt:1 | Còn log | Xoá"])
+        noted = self.ensure_mr(gitlab, branch, "MPS-72", code_review=True)
+        self.assertEqual((noted["code_review_attached"], noted["code_review_warning_count"]), ("note", 1))
+        self.assertEqual([path for path, _ in gitlab.notes], ["/projects/1/merge_requests/1/notes"])
+        self.assertIn("`BASE-DEBUG-LEFTOVER` · `b.txt:1` · Còn log", gitlab.notes[0][1])
+        self.assertEqual(self.ensure_mr(gitlab, branch, "MPS-72", code_review=True)["code_review_attached"], "already")
+        self.commit_and_push(branch, "MPS-72", "c.txt")
+        failing = FakeMrGitLab(mrs=gitlab.mrs, notes_status=500)
+        failed = self.ensure_mr(failing, branch, "MPS-72", code_review=True)
+        self.assertEqual((failed["ok"], failed["code_review_attached"], failed["code_review_reason"]),
+                         (True, "none", "note_failed"))
+        self.assertEqual([w["code"] for w in failed["warnings"]], ["code_review_note_failed"])
+        self.write("d.txt", "not pushed\n")
+        self.approve(["a.txt", "b.txt", "c.txt", "d.txt"])
+        self.commit("feat: MPS-72 d", "d.txt")
+        unpushed = self.ensure_mr(gitlab, branch, "MPS-72", code_review=True)
+        self.assertEqual((unpushed["code_review_attached"], unpushed["code_review_reason"]), ("none", "not_in_branch"))
+        self.assertEqual(mps._select_committed_review(self.repo, "feature/MPS-1-other"), (None, "other_branch"))
+        plain = self.ensure_mr(gitlab, branch, "MPS-72")
+        self.assertNotIn("code_review_attached", plain)
+
+    def test_resume_keeps_the_mr_report(self):
+        """I12: step 6 running again after the commit does not touch the committed review."""
+        self.write_env(MPS_GITLAB_URL="https://git.example", MPS_GITLAB_PAT="gitlab-token",
+                       MPS_GITLAB_PROJECT="grp/proj")
+        branch = "feature/MPS-73-a"
+        self.prepare(branch, "MPS-73")
+        self.write("a.txt", "a\n")
+        self.write("left.txt", "not for this ticket\n")
+        self.approve(["a.txt"], out_of_scope=["left.txt"], code_findings=["BASE-NEW-TODO | minor | a.txt:1 | p | s"])
+        self.commit("feat: MPS-73 a", "a.txt")
+        with open(mps.committed_review_path(self.repo), "rb") as handle:
+            before = handle.read()
+        bundle_id = self.make_bundle()
+        self.review_code(bundle_id)
+        with open(mps.committed_review_path(self.repo), "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        self.mps("git", "push", "--branch=" + branch, "--base=develop")
+        result = self.ensure_mr(FakeMrGitLab(), branch, "MPS-73", code_review=True)
+        self.assertEqual((result["code_review_attached"], result["code_review_warning_count"]), ("description", 1))
+
 
 # ---------------------------------------------------------------------------
 # 0.1.1: project integration, version check, release discipline, bootstrap
@@ -1755,6 +2199,68 @@ SLOW_INSTALLER_SECONDS = 25
 PIPE_CLOSE_MAX_SECONDS = 15
 # The stalled lookup is given 0.2 s; anything near the real 3 s would mean the thread limit does not work.
 STALLED_LOOKUP_MAX_SECONDS = 2
+# A project rule file with one blocker rule for the .txt files of the test repo (pushed to origin/develop).
+PROJECT_RULES = "\n".join([
+    "---", "version: 1", "---", "# Quy tắc dự án",
+    "## SH-NO-PRINT [blocker] Không để lệnh print trong file", "paths: **/*.txt", "",
+    "Không in ra console.", ""])
+# R1: the scope bundle of GitFlowTests.golden_scope_bundle(), recorded from 0.1.1 before the code review was added.
+GOLDEN_SCOPE_BUNDLE = "\n".join([
+    "# Change bundle for scope review",
+    "",
+    "Bundle-ID: <BUNDLE-ID>",
+    "(copy it into your reply as the line `BUNDLE: <BUNDLE-ID>`)",
+    "",
+    "Base: origin/develop. Truncated: no.",
+    "",
+    "## 0. Files to classify (each must appear exactly once in your FILES: block)",
+    "",
+    "- app.txt",
+    "- new.txt",
+    "- src/a.txt",
+    "",
+    "## 1. Commits on this branch not yet in origin/develop",
+    "",
+    "```diff",
+    "diff --git a/src/a.txt b/src/a.txt",
+    "new file mode 100644",
+    "index 0000000..0016606",
+    "--- /dev/null",
+    "+++ b/src/a.txt",
+    "@@ -0,0 +1,2 @@",
+    "+a1",
+    "+a2",
+    "",
+    "```",
+    "",
+    "## 2. Uncommitted changes (staged + unstaged)",
+    "",
+    "```diff",
+    "diff --git a/app.txt b/app.txt",
+    "index c0d0fb4..b87cf49 100644",
+    "--- a/app.txt",
+    "+++ b/app.txt",
+    "@@ -1,2 +1,2 @@",
+    " line1",
+    "-line2",
+    "+line2 edited",
+    "",
+    "```",
+    "",
+    "## 3. New untracked files",
+    "",
+    "### new.txt",
+    "",
+    "```",
+    "brand new",
+    "",
+    "```",
+    "",
+    "",
+    "## 4. Secret files (changed, content hidden)",
+    "",
+    "- cfg/.env.local: [content hidden]",
+]) + "\n"
 
 
 def _read_bytes(path):
@@ -2158,6 +2664,652 @@ class EnvFillGuideTests(unittest.TestCase):
         guide = mps.env_fill_guide({}, "https://j", "https://g", keys=["MPS_GITLAB_URL"])
         self.assertEqual(guide[0]["steps"], ["Khôi phục dòng mặc định trong file .env: "
                                              "MPS_GITLAB_URL=https://git-gst.mto.zing.vn"])
+
+
+# ---------------------------------------------------------------------------
+# 0.2.0: code review rules, numbered net diff, findings (pure)
+# ---------------------------------------------------------------------------
+
+REVIEW_DIR = os.path.join(SCRIPTS_DIR, "..", "references", "review")
+JIRA_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*-[0-9]+")
+
+
+def rule_file(*rules, **frontmatter):
+    """A rule file: optional frontmatter (key=value), then `rules` given as (heading, body) pairs or full text."""
+    parts = []
+    if frontmatter:
+        parts.append("---")
+        parts.extend("%s: %s" % item for item in frontmatter.items())
+        parts.append("---")
+    parts.append("# Title")
+    for rule in rules:
+        parts.extend(["", rule[0], "", rule[1]] if isinstance(rule, tuple) else ["", rule])
+    return "\n".join(parts) + "\n"
+
+
+def problem_lines(parsed):
+    return [p["line"] for p in parsed["problems"]]
+
+
+class ParseRuleFileTests(unittest.TestCase):
+    """T1."""
+
+    def test_frontmatter_lists_and_rules(self):
+        text = "\n".join([
+            "---", "version: 1", "# a comment", "extends: [unity-csharp, 'python']", "ignore: Assets/Gen/**, `*.bak`",
+            "disable: [BASE-NEW-TODO]  # not supported in phase 1", "---", "Preamble text, ignored.", "",
+            "## SH-NO-SYNC-IO [Blocker] Không đọc file đồng bộ", "", "", "paths: [Assets/**/*.cs, \"Tools/*.cs\"]",
+            "Body line.", "", "### a sub heading is body text", "```python", "## a comment inside a fence", "```",
+            "##not-a-heading", "", "## SH-OTHER [minor] Khác", "No paths line here.", ""])
+        parsed = mps.parse_rule_file(text, "project")
+        self.assertEqual(parsed["problems"], [])
+        self.assertEqual((parsed["version"], parsed["extends"], parsed["ignore"], parsed["unknown_keys"]),
+                         (1, ["unity-csharp", "python"], ["Assets/Gen/**", "*.bak"], ["disable"]))
+        first, second = parsed["rules"]
+        self.assertEqual((first["id"], first["severity"], first["title"], first["paths"], first["line"]),
+                         ("SH-NO-SYNC-IO", "blocker", "Không đọc file đồng bộ", ["Assets/**/*.cs", "Tools/*.cs"], 10))
+        self.assertEqual(first["body"].splitlines()[0], "Body line.")
+        self.assertIn("## a comment inside a fence", first["body"])
+        self.assertIn("##not-a-heading", first["body"])
+        self.assertEqual((second["paths"], second["body"]), (["**"], "No paths line here."))
+
+    def test_missing_frontmatter_bom_crlf_and_lone_cr(self):
+        for newline in ("\n", "\r\n", "\r"):
+            text = mps._BOM + newline.join(["# T", "", "## A-B [major] X", "body", ""])
+            parsed = mps.parse_rule_file(text, "project")
+            self.assertEqual(parsed["problems"], [], newline)
+            self.assertEqual([(r["id"], r["line"]) for r in parsed["rules"]], [("A-B", 3)], newline)
+
+    def test_problems_make_rules_invalid(self):
+        text = "\n".join([
+            "---", "version: 2", "ignore: a//b", "ignore: x", "just text", "extends: Unity", "---",
+            "## Overview", "## ABC-12 [major] Jira shaped", "## SH-2-NULL [major] Jira shaped too",
+            "## mps-a [major] lower case", "## A_B [minor] underscore", "## GOOD [critical] bad severity",
+            "## DUP [major] first", "## DUP [minor] second", "## GLOB [minor] bad glob", "paths: ../x", "```", "open"])
+        parsed = mps.parse_rule_file(text, "project")
+        self.assertEqual(problem_lines(parsed), [2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 15, 17, 18])
+        messages = dict((p["line"], p["message"]) for p in parsed["problems"])
+        self.assertIn("đã có ở dòng 14", messages[15])
+        self.assertIn("ABC-12", messages[9])
+        self.assertEqual([r["id"] for r in parsed["rules"]], ["DUP", "GLOB"])
+
+    def test_unclosed_frontmatter_stops_parsing(self):
+        parsed = mps.parse_rule_file("---\nversion: 1\n## A [major] x\n", "project")
+        self.assertEqual((problem_lines(parsed), parsed["rules"]), ([1], []))
+
+    def test_frontmatter_only_file_is_valid(self):
+        parsed = mps.parse_rule_file("---\nversion: 1\nextends: web\n---\n", "project")
+        self.assertEqual((parsed["problems"], parsed["rules"], parsed["extends"]), ([], [], ["web"]))
+
+    def test_oversized_project_file_is_one_problem(self):
+        parsed = mps.parse_rule_file("x" * (mps.PROJECT_RULES_MAX_CHARS + 1), "project")
+        self.assertEqual(problem_lines(parsed), [1])
+
+    def test_extends_is_a_problem_in_shipped_files(self):
+        self.assertEqual(problem_lines(mps.parse_rule_file("---\nextends: web\n---\n", "base")), [2])
+
+    def test_readme_example_file_parses(self):
+        readme = _read_bytes(os.path.join(REPO_ROOT, "README.md")).decode("utf-8")
+        section = readme[readme.index("## Quy tắc review code theo dự án"):]
+        example = re.search(r"````markdown\n(.*?)````", section, re.DOTALL).group(1)
+        parsed = mps.parse_rule_file(example, "project")
+        self.assertEqual(parsed["problems"], [])
+        self.assertEqual([(r["id"], r["severity"]) for r in parsed["rules"]],
+                         [("SH-NO-SYNC-IO", "blocker"), ("SH-SCORE-ON-SERVER", "major"),
+                          ("UNITY-NO-FIND-IN-UPDATE", "blocker")])
+        self.assertEqual((parsed["extends"], parsed["ignore"]),
+                         (["unity-csharp"], ["**/Assets/ThirdParty/**", "**/Assets/Generated/**"]))
+
+
+class ShippedRuleFileTests(unittest.TestCase):
+    """T2."""
+
+    def test_blocker_is_lowered_in_shipped_layers(self):
+        parsed = mps.parse_rule_file("## BASE-X [blocker] x\nbody\n", "base")
+        self.assertEqual((parsed["rules"][0]["severity"], parsed["rules"][0]["downgraded"], parsed["downgraded"]),
+                         ("major", True, ["BASE-X"]))
+
+    def test_real_files_parse_cleanly(self):
+        base, profiles = mps._load_shipped_rules()
+        self.assertEqual(sorted(profiles), sorted(mps.SHIPPED_PROFILES))
+        seen = []
+        for layer, text in [("base", base)] + [("profile:" + n, t) for n, t in sorted(profiles.items())]:
+            parsed = mps.parse_rule_file(text, layer)
+            self.assertEqual((parsed["problems"], parsed["version"], parsed["downgraded"]), ([], 1, []), layer)
+            self.assertGreaterEqual(len(parsed["rules"]), 4, layer)
+            for rule in parsed["rules"]:
+                self.assertIn(rule["severity"], ("major", "minor"), rule["id"])
+                self.assertRegex(rule["id"], mps._RULE_ID_RE)
+                self.assertIn("```", rule["body"], rule["id"])
+                self.assertIsNone(JIRA_KEY_RE.search(rule["id"]))
+                seen.append(rule["id"])
+            self.assertNotRegex(text, r"\[blocker\]")
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_scaffold_template_is_valid_and_has_no_active_rule(self):
+        parsed = mps.parse_rule_file(_read_bytes(mps.REVIEW_RULES_TEMPLATE_PATH).decode("utf-8"), "project")
+        self.assertEqual((parsed["problems"], parsed["rules"], parsed["unknown_keys"]), ([], [], []))
+
+    def test_broken_shipped_file_is_an_internal_error(self):
+        with self.assertRaises(mps.MpsError) as ctx:
+            mps.build_effective_rules("## BAD [oops] x\n", {}, None, {})
+        self.assertEqual(ctx.exception.code, "internal_error")
+        with self.assertRaises(mps.MpsError) as ctx:
+            mps.build_effective_rules("", {"web": "## W [major] x\n```\n"}, None, {"web": [""]})
+        self.assertIn("profiles/web.md", ctx.exception.message)
+
+
+BASE_TEXT = rule_file(("## BASE-A [major] a", "body a"), ("## BASE-B [minor] b", "body b"))
+PROFILE_TEXTS = {
+    "unity-csharp": rule_file(("## UNITY-A [major] u", "paths: **/*.cs\n\nbody"), ignore="[**/*.prefab]"),
+    "web": rule_file(("## WEB-A [minor] w", "paths: *.js\n\nbody")),
+}
+
+
+class EffectiveRulesTests(unittest.TestCase):
+    """T3."""
+
+    def ids(self, effective):
+        return [(r["id"], r["severity"], r["layer"]) for r in effective["rules"]]
+
+    def test_absent_project_and_detected_profile(self):
+        effective = mps.build_effective_rules(BASE_TEXT, PROFILE_TEXTS, None, {"unity-csharp": ["Game"]})
+        self.assertEqual(self.ids(effective), [("BASE-A", "major", "base"), ("UNITY-A", "major", "profile:unity-csharp"),
+                                               ("BASE-B", "minor", "base")])
+        self.assertEqual(effective["project_rules"], {"status": "absent", "problems": [], "unknown_keys": []})
+        self.assertEqual(effective["profiles"], [{"name": "unity-csharp", "roots": ["Game"], "source": "detected"}])
+        self.assertEqual(effective["ignore"], [{"glob": "**/*.prefab", "roots": ["Game"],
+                                                "source": "profile:unity-csharp"}])
+
+    def test_project_replaces_in_place_extends_and_unknown_profiles(self):
+        project = rule_file(("## BASE-B [blocker] stricter", "body"), ("## SH-NEW [minor] new", "body"),
+                            extends="[web, unity-csharp, unity]", ignore="Docs/**")
+        effective = mps.build_effective_rules(BASE_TEXT, PROFILE_TEXTS, project, {"unity-csharp": ["Game"]})
+        self.assertEqual(self.ids(effective), [("BASE-B", "blocker", "project"), ("BASE-A", "major", "base"),
+                                               ("UNITY-A", "major", "profile:unity-csharp"),
+                                               ("WEB-A", "minor", "profile:web"), ("SH-NEW", "minor", "project")])
+        self.assertEqual(effective["profiles"], [{"name": "unity-csharp", "roots": ["", "Game"], "source": "both"},
+                                                 {"name": "web", "roots": [""], "source": "extends"}])
+        self.assertEqual(effective["unknown_profiles"], ["unity"])
+        self.assertEqual(effective["project_rules"]["status"], "applied")
+        self.assertIn({"glob": "Docs/**", "roots": [""], "source": "project"}, effective["ignore"])
+
+    def test_invalid_project_is_skipped_entirely(self):
+        project = rule_file(("## SH-STOP [blocker] stop", "body"), ("## SH-BAD [fatal] bad", "body"),
+                            extends="web", ignore="Docs/**")
+        effective = mps.build_effective_rules(BASE_TEXT, PROFILE_TEXTS, project, {})
+        self.assertEqual(self.ids(effective), [("BASE-A", "major", "base"), ("BASE-B", "minor", "base")])
+        self.assertEqual(effective["project_rules"]["status"], "invalid")
+        self.assertEqual(problem_lines(effective["project_rules"]), [11])
+        self.assertEqual((effective["profiles"], effective["ignore"]), ([], []))
+
+
+class RuleGlobTests(unittest.TestCase):
+    """T4."""
+
+    def check(self, glob, matching, other):
+        for path in matching:
+            self.assertTrue(mps.rule_glob_regex(glob).match(path), (glob, path))
+        for path in other:
+            self.assertFalse(mps.rule_glob_regex(glob).match(path), (glob, path))
+
+    def test_semantics(self):
+        self.check("**/*.cs", ["A.cs", "a/b/C.cs"], ["A.csx", "a/b.cs/x"])
+        self.check("*.cs", ["A.cs", "a/b/C.cs"], ["A.txt"])
+        self.check("Assets/**", ["Assets/x", "Assets/a/b"], ["Assets", "X/Assets/y"])
+        self.check("Assets/**/Editor/*.cs", ["Assets/Editor/a.cs", "Assets/a/b/Editor/c.cs"], ["Editor/a.cs"])
+        self.check("**", ["a", "a/b/c"], [])
+        self.check("./Docs/", ["Docs/x.md"], ["Docs"])
+        self.check("a?c/[x].txt", ["abc/[x].txt"], ["abc/x.txt", "a/c/[x].txt"])
+
+    def test_invalid_globs(self):
+        for glob in ("", "   ", "a//b", "../x", "a/./b", "a\0b"):
+            with self.assertRaises(ValueError, msg=glob):
+                mps.rule_glob_regex(glob)
+
+    def test_anchoring_to_roots(self):
+        rule = {"paths": ["**/*.cs"], "roots": ["Game"]}
+        self.assertTrue(mps.rule_applies(rule, "Game/Assets/X.cs"))
+        self.assertFalse(mps.rule_applies(rule, "Tools/X.cs"))
+        self.assertTrue(mps.path_matches("Game\\Assets\\X.cs", ["Assets/*.cs"], ["Game"]))
+        # The generated-pattern helper keeps its own semantics (no root match for **/).
+        self.assertIsNone(mps._glob_regex("**/*.cs").match("A.cs"))
+
+
+class FilterRulesTests(unittest.TestCase):
+    """T5."""
+
+    def rule(self, rule_id, severity, paths=None, body="x"):
+        """A project rule; paths None = no `paths:` line (the default `**`)."""
+        return {"id": rule_id, "severity": severity, "title": "t", "paths": list(paths or ["**"]),
+                "explicit_paths": paths is not None, "roots": [""], "layer": "project", "body": body}
+
+    def test_split_ignored_keeps_order(self):
+        entries = [{"glob": "**/*.prefab", "roots": ["Game"]}]
+        self.assertEqual(mps.split_ignored(["Game/A.prefab", "a.cs", "B.prefab"], entries),
+                         (["a.cs", "B.prefab"], ["Game/A.prefab"]))
+
+    def test_project_rules_override_profile_ignores_only(self):
+        """M1b: an L3 rule makes a profile-ignored file reviewed; the project's own ignore still wins."""
+        entries = [{"glob": "**/*.prefab", "roots": ["Game"], "source": "profile:unity-csharp"},
+                   {"glob": "Game/Old/**", "roots": [""], "source": "project"}]
+        rules = [self.rule("SH-PREFAB", "blocker", ["**/*.prefab"]),
+                 dict(self.rule("BASE-ALL", "major"), layer="base")]
+        self.assertEqual(mps.split_ignored(["Game/A.prefab", "Game/Old/B.prefab", "Game/C.cs"], entries, rules),
+                         (["Game/A.prefab", "Game/C.cs"], ["Game/Old/B.prefab"]))
+        self.assertEqual(mps.split_ignored(["Game/A.prefab"], entries, rules[1:]), ([], ["Game/A.prefab"]))
+        # M1 round 2: only an explicit paths: line overrides a profile ignore; a project rule without one (default
+        # **) keeps every Unity asset ignored.
+        self.assertEqual(mps.split_ignored(["Game/A.prefab", "Game/C.cs"], entries, [self.rule("SH-ALL", "blocker")]),
+                         (["Game/C.cs"], ["Game/A.prefab"]))
+        self.assertEqual(mps.parse_rule_file("## A-B [major] x\nbody\n", "project")["rules"][0]["explicit_paths"], False)
+        self.assertEqual(mps.parse_rule_file("## A-B [major] x\npaths: **/*.prefab\n", "project")["rules"][0]
+                         ["explicit_paths"], True)
+
+    def test_project_rules_matching_nothing(self):
+        """M1a: root-anchored paths that miss a Unity project in a subfolder are reported."""
+        rules = [self.rule("SH-WRONG", "blocker", ["Assets/Scripts/**/*.cs"]),
+                 self.rule("SH-RIGHT", "blocker", ["**/Assets/Scripts/**/*.cs"]),
+                 dict(self.rule("BASE-X", "major", ["nothing/**"]), layer="base")]
+        files = ["Client/Game/Assets/Scripts/Player.cs", "README.md"]
+        self.assertEqual([r["id"] for r in mps.project_rules_matching_nothing(rules, files)], ["SH-WRONG"])
+        # m-b: a file hidden by the project's own ignore is never reviewed, so it does not count as a match.
+        own_ignore = [{"glob": "**/Assets/Scripts/**", "roots": [""], "source": "project"}]
+        self.assertEqual([r["id"] for r in mps.project_rules_matching_nothing(rules, files, own_ignore)],
+                         ["SH-WRONG", "SH-RIGHT"])
+        profile_ignore = [{"glob": "**/Assets/Scripts/**", "roots": [""], "source": "profile:unity-csharp"}]
+        self.assertEqual([r["id"] for r in mps.project_rules_matching_nothing(rules, files, profile_ignore)],
+                         ["SH-WRONG"])
+        warning = mps.rule_matches_nothing_warning(rules[0], "trên nhánh develop")
+        self.assertEqual((warning["code"], warning["rule"], warning["paths"]),
+                         ("project_rule_matches_nothing", "SH-WRONG", ["Assets/Scripts/**/*.cs"]))
+
+    def test_only_rules_matching_a_path(self):
+        rules = [self.rule("CS", "major", ["*.cs"]), self.rule("PY", "major", ["*.py"])]
+        self.assertEqual(mps.filter_rules(rules, ["a/b.cs"], 10 ** 6), ([rules[0]], []))
+        self.assertEqual(mps.filter_rules(rules, [], 10 ** 6), ([], []))
+
+    def test_cap_keeps_blockers_and_drops_minor_first(self):
+        rules = [self.rule("STOP", "blocker", body="x" * 300), self.rule("MAJ", "major", body="y" * 100),
+                 self.rule("MIN", "minor", body="z" * 100), self.rule("MIN-B", "minor", body="z")]
+        kept, dropped = mps.filter_rules(rules, ["a"], 200)
+        self.assertEqual(([r["id"] for r in kept], dropped), (["STOP"], ["MAJ", "MIN", "MIN-B"]))
+        size = len(mps._render_rule_block(rules[1])) + 1
+        kept, dropped = mps.filter_rules(rules, ["a"], 400 + size)
+        self.assertEqual(([r["id"] for r in kept], dropped), (["STOP", "MAJ"], ["MIN", "MIN-B"]))
+
+
+MULTI_HUNK_DIFF = "\n".join([
+    "diff --git a/src/A.cs b/src/A.cs", "index 1111111..2222222 100644", "--- a/src/A.cs", "+++ b/src/A.cs",
+    "@@ -1,4 +1,5 @@ class A", " l1", "+added2", " l2", " l3", " l4",
+    "@@ -20,3 +21,3 @@ void F()", " c21", "-old", "+new22", " c23",
+    "@@ -40,4 +41,3 @@", " c41", "-gone", " c42", " c43",
+    "diff --git a/e.txt b/e.txt", "index 3333333..e69de29 100644", "--- a/e.txt", "+++ b/e.txt",
+    "@@ -1,2 +0,0 @@", "-x", "-y",
+    "diff --git a/nl.txt b/nl.txt", "index 1..2 100644", "--- a/nl.txt", "+++ b/nl.txt",
+    "@@ -1 +1 @@", "-old", "\\ No newline at end of file", "+new", "\\ No newline at end of file",
+    "diff --git a/old/N.cs b/new/N.cs", "similarity index 90%", "rename from old/N.cs", "rename to new/N.cs",
+    "index 4444444..5555555 100644", "--- a/old/N.cs", "+++ b/new/N.cs", "@@ -1,2 +1,2 @@", " keep", "-before",
+    "+after",
+    "diff --git a/r1.txt b/r2.txt", "similarity index 100%", "rename from r1.txt", "rename to r2.txt",
+    "diff --git a/n.txt b/n.txt", "new file mode 100644", "index 0000000..6666666", "--- /dev/null", "+++ b/n.txt",
+    "@@ -0,0 +1,2 @@", "+a", "+b",
+    "diff --git a/d.txt b/d.txt", "deleted file mode 100644", "index 7777777..0000000", "--- a/d.txt",
+    "+++ /dev/null", "@@ -1,2 +0,0 @@", "-a", "-b",
+    "diff --git a/Art/my logo.png b/Art/my logo.png", "index 8888888..9999999 100644",
+    "Binary files a/Art/my logo.png and b/Art/my logo.png differ",
+    "diff --git a/my file.txt b/my file.txt", "index 1..2 100644", "--- a/my file.txt\t", "+++ b/my file.txt\t",
+    "@@ -1,2 +1,2 @@", "---- x", "+--- y", " ctx\r",
+    "diff --git a/mode.sh b/mode.sh", "old mode 100644", "new mode 100755",
+]) + "\n"
+
+
+class NetDiffTests(unittest.TestCase):
+    """T6."""
+
+    def test_parse_and_ranges(self):
+        files = mps.parse_diff_files(MULTI_HUNK_DIFF)
+        self.assertEqual([(f["path"], f["status"]) for f in files], [
+            ("src/A.cs", "modified"), ("e.txt", "modified"), ("nl.txt", "modified"), ("new/N.cs", "renamed"),
+            ("r2.txt", "renamed"), ("n.txt", "added"), ("d.txt", "deleted"), ("Art/my logo.png", "modified"),
+            ("my file.txt", "modified"), ("mode.sh", "modified")])
+        self.assertEqual(files[3]["old_path"], "old/N.cs")
+        self.assertTrue(files[7]["binary"])
+        self.assertTrue(files[9]["mode_only"])
+        self.assertFalse(files[4]["mode_only"])
+        self.assertEqual(mps.parse_changed_ranges(MULTI_HUNK_DIFF), {
+            "src/A.cs": [[1, 5], [21, 23], [41, 43]], "e.txt": [[1, 1]], "nl.txt": [[1, 1]], "new/N.cs": [[1, 2]],
+            "r2.txt": [], "n.txt": [[1, 2]], "my file.txt": [[1, 2]], "mode.sh": []})
+
+    def test_rendering_and_kinds(self):
+        rendered = mps.render_numbered_diff(mps.parse_diff_files(MULTI_HUNK_DIFF), None)
+        text = rendered["text"]
+        self.assertIn("### src/A.cs  [modified]\n@@ -1,4 +1,5 @@ class A\n     1   l1\n     2 + added2\n", text)
+        self.assertIn("       - old\n    22 + new22\n", text)
+        self.assertIn("       \\ No newline at end of file\n", text)
+        self.assertIn("### new/N.cs  [renamed from old/N.cs]", text)
+        self.assertIn("### d.txt  [deleted - only file-level findings, use line -]\n### Art/my logo.png  [binary", text)
+        self.assertIn("       - --- x\n     1 + --- y\n     2   ctx\n", text)
+        self.assertIn("### mode.sh  [mode change only]", text)
+        self.assertNotIn("\r", text)
+        self.assertEqual((rendered["file_kinds"]["d.txt"], rendered["file_kinds"]["Art/my logo.png"]),
+                         ("deleted", "binary"))
+        self.assertEqual(rendered["truncated_paths"], [])
+
+    def test_quoted_path_and_line_separator_characters(self):
+        quoted = "\n".join(['diff --git "a/\\303\\251 x.cs" "b/\\303\\251 x.cs"', "index 1..2 100644",
+                            '--- "a/\\303\\251 x.cs"', '+++ "b/\\303\\251 x.cs"', "@@ -1,2 +1,2 @@",
+                            " a" + chr(0x2028) + "b", "-c", "+d", ""])
+        self.assertEqual(mps._unquote_git_path('"a/\\303\\251\\t\\"q\\""'), 'a/' + chr(0xE9) + '\t"q"')
+        self.assertEqual(mps.parse_changed_ranges(quoted), {chr(0xE9) + " x.cs": [[1, 2]]})
+        binary = 'diff --git "a/\\303\\251.png" "b/\\303\\251.png"\nBinary files differ\n'
+        self.assertEqual(mps.parse_diff_files(binary)[0]["path"], chr(0xE9) + ".png")
+
+    def test_budget_cuts_at_line_boundaries(self):
+        files = mps.parse_diff_files(MULTI_HUNK_DIFF)
+        full = mps.render_numbered_diff(files, None)["text"]
+        cut_at = full.index("    22 + new22")
+        rendered = mps.render_numbered_diff(files, cut_at)
+        self.assertLessEqual(len(rendered["text"]), cut_at + 60)
+        self.assertEqual(rendered["ranges"]["src/A.cs"], [[1, 5], [21, 21]])
+        self.assertEqual(rendered["truncated_paths"][0], "src/A.cs")
+        self.assertIn("### src/A.cs  [modified] - TRUNCATED: shown up to line 21", rendered["text"])
+        self.assertEqual(rendered["file_kinds"]["e.txt"], "not_shown")
+        self.assertNotIn("e.txt", rendered["ranges"])
+        self.assertEqual(set(rendered["truncated_paths"]), set(f["path"] for f in files))
+
+    def test_long_lines_are_capped(self):
+        diff = "diff --git a/m.js b/m.js\n--- a/m.js\n+++ b/m.js\n@@ -0,0 +1 @@\n+" + "x" * 50 + "\n"
+        rendered = mps.render_numbered_diff(mps.parse_diff_files(diff), None, line_cap=10)
+        self.assertIn("     1 + xxxxxxxxxx [... dòng bị cắt bớt ...]\n", rendered["text"])
+        self.assertEqual(rendered["ranges"]["m.js"], [[1, 1]])
+
+    def test_untracked_files(self):
+        files = [mps.untracked_file_diff("u.txt", "a\r\nb\n", "text", False),
+                 mps.untracked_file_diff("big.txt", "1\n2\n", "text", True),
+                 mps.untracked_file_diff("img.png", None, "binary", False),
+                 mps.untracked_file_diff("huge.bin", None, "too_large", False),
+                 mps.untracked_file_diff("empty.txt", "", "text", False)]
+        rendered = mps.render_numbered_diff(files, None)
+        self.assertIn("### u.txt  [untracked (new file)]\n     1 + a\n     2 + b\n", rendered["text"])
+        self.assertIn("### big.txt  [untracked (new file)] - TRUNCATED: shown up to line 2", rendered["text"])
+        self.assertEqual(rendered["truncated_paths"], ["big.txt"])
+        self.assertEqual((rendered["file_kinds"]["img.png"], rendered["file_kinds"]["huge.bin"]),
+                         ("binary", "too_large"))
+        self.assertEqual((rendered["ranges"]["u.txt"], rendered["ranges"]["empty.txt"]), ([[1, 2]], []))
+
+
+def finding_lines(*lines):
+    entries, _ = mps.parse_findings("\n".join(("FINDINGS:",) + lines + ("BUNDLE: ab12",)))
+    return entries
+
+
+class ParseFindingsTests(unittest.TestCase):
+    """T7."""
+
+    def test_none_and_bundle_line(self):
+        self.assertEqual(mps.parse_findings("x\nFINDINGS: none\n\nBUNDLE: ABCdef12\n"), ([], "abcdef12"))
+        self.assertEqual(mps.parse_findings("- FINDINGS: `None`\r\nBUNDLE: `ab12`\r\n"), ([], "ab12"))
+        self.assertEqual(mps.parse_findings("FINDINGS: none\nBUNDLE missing\n")[1], None)
+        self.assertEqual(mps.parse_findings("no block here\nBUNDLE: ab12\n"), (None, None))
+
+    def test_well_formed_lines(self):
+        a, b, c, d = finding_lines("- `R-A` | `Major` | `src/a b.cs:10-12` | p1 | fix a | then b",
+                                   "* R-B | minor | ./x\\y.cs:3 " + chr(0x2013) + " 4 | p | s",
+                                   "R-C | blocker | Builds/game.apk:- | p | s",
+                                   "R-D | minor | dir:odd/a.cs:7 | p | s")
+        self.assertEqual((a["rule"], a["severity"], a["path"], a["line"], a["line_start"], a["line_end"],
+                          a["problem"], a["suggestion"]),
+                         ("R-A", "major", "src/a b.cs", "10-12", 10, 12, "p1", "fix a | then b"))
+        self.assertEqual((b["path"], b["line"]), ("x/y.cs", "3-4"))
+        self.assertEqual((c["line"], c["line_start"], c["line_end"]), ("-", None, None))
+        self.assertEqual((d["path"], d["line"]), ("dir:odd/a.cs", "7"))
+
+    def test_bad_lines(self):
+        entries = finding_lines("R-D | major | a.cs:0 | p | s", "R-E | major | a.cs:12-10 | p | s",
+                                "R-F | major | a.cs | p | s", "| R-G | major | a.cs:1 | p | s |",
+                                "R-H | serious | a.cs:1 | p | s", "R-I | major | a.cs:1 | p |", "only text")
+        self.assertEqual([e["ok"] for e in entries], [False] * 7)
+
+    def test_fence_ends_the_block_and_identical_repeats_are_fine(self):
+        text = "\n".join(["```", "FINDINGS:", "R-NEW | major | b.cs:2 | p | s", "```", "BUNDLE: 22"])
+        entries, bundle_id = mps.parse_findings(text)
+        self.assertEqual(([e["rule"] for e in entries], bundle_id), (["R-NEW"], "22"))
+        entries, bundle_id = mps.parse_findings(text + "\n\nNhắc lại:\n" + text)
+        self.assertEqual(([e["rule"] for e in entries], bundle_id), (["R-NEW"], "22"))
+
+    def test_different_blocks_are_ambiguous(self):
+        """Fail closed: an earlier quoted example is never silently skipped, even with another bundle id."""
+        text = "\n".join(["Example:", "FINDINGS:", "R-OLD | major | a.cs:1 | p | s", "BUNDLE: 11", "",
+                          "FINDINGS:", "R-NEW | major | b.cs:2 | p | s", "BUNDLE: 22"])
+        entries, bundle_id = mps.parse_findings(text)
+        self.assertEqual(([(e["ok"], e["error"]) for e in entries], bundle_id),
+                         ([(False, mps._AMBIGUOUS_FINDINGS)], "22"))
+
+    def test_none_followed_by_findings_is_bad_format(self):
+        entries, _ = mps.parse_findings("FINDINGS: none\nR-A | major | a.cs:1 | p | s\nBUNDLE: ab\n")
+        self.assertEqual([e["ok"] for e in entries], [False])
+
+    def test_fenced_block_body_is_read(self):
+        """C1a: a fence right after the header opens the block; the next fence closes it."""
+        text = "\n".join(["FINDINGS:", "", "```", "SH-NO-SYNC-IO | blocker | a.cs:3 | p | s", "R-B | minor | b.cs:1 | p | s",
+                          "```", "BUNDLE: ab12"])
+        entries, bundle_id = mps.parse_findings(text)
+        self.assertEqual(([e["rule"] for e in entries], bundle_id), (["SH-NO-SYNC-IO", "R-B"], "ab12"))
+
+    def test_empty_header_is_bad_format(self):
+        """C1b: the reviewer must write `none` when there is nothing."""
+        for text in ("FINDINGS:\nBUNDLE: ab12\n", "FINDINGS:\n```\n```\nBUNDLE: ab12\n"):
+            entries, bundle_id = mps.parse_findings(text)
+            self.assertEqual(([e["ok"] for e in entries], bundle_id), ([False], "ab12"), text)
+
+    def test_numbered_and_bold_rule_ids(self):
+        """C1c."""
+        entries = finding_lines("1. SH-NO-SYNC-IO | blocker | a.cs:3 | p | s",
+                                "2) **SH-NO-SYNC-IO** | blocker | a.cs:4 | p | s",
+                                "- __`SH-NO-SYNC-IO`__ | blocker | a.cs:5 | p | s")
+        self.assertEqual([(e["ok"], e["rule"], e["line"]) for e in entries],
+                         [(True, "SH-NO-SYNC-IO", "3"), (True, "SH-NO-SYNC-IO", "4"), (True, "SH-NO-SYNC-IO", "5")])
+
+    def test_header_quoted_after_the_block_is_ambiguous(self):
+        """A "FINDINGS: none" quoted after the real block can never win: the reply is sent back."""
+        text = "\n".join(["FINDINGS:", "R-A | major | a.cs:1 | p | s", "BUNDLE: ab12", "",
+                          "Nếu không có lỗi thì ghi:", "FINDINGS: none"])
+        entries, bundle_id = mps.parse_findings(text)
+        self.assertEqual(([e["ok"] for e in entries], bundle_id), ([False], "ab12"))
+
+    def test_text_after_a_fenced_block_is_bad(self):
+        entries, _ = mps.parse_findings("FINDINGS:\n```\nR-A | major | a.cs:1 | p | s\n```\nR-B | minor | b.cs:1 | p "
+                                        "| s\nBUNDLE: ab12\n")
+        self.assertEqual([(e["ok"], e.get("error")) for e in entries],
+                         [(True, None), (False, mps._TEXT_AFTER_BLOCK)])
+
+
+VERIFY_REVIEW = {
+    "rules": [
+        {"id": "SH-STOP", "severity": "blocker", "layer": "project", "title": "stop", "paths": ["**/*.txt"],
+         "roots": [""]},
+        {"id": "BASE-A", "severity": "major", "layer": "base", "title": "a", "paths": ["**"], "roots": [""]},
+        {"id": "UNITY-A", "severity": "minor", "layer": "profile:unity-csharp", "title": "u", "paths": ["**/*.cs"],
+         "roots": ["Game"]},
+    ],
+    "reviewed_paths": ["a.txt", "Game/X.cs", "Tools/X.cs", "logo.png", "big.txt"],
+    "ignored_paths": ["Game/M.prefab"],
+    "ranges": {"a.txt": [[1, 5], [20, 22]], "Game/X.cs": [[1, 3]], "Tools/X.cs": [[1, 1]]},
+    "file_kinds": {"a.txt": "text", "Game/X.cs": "text", "Tools/X.cs": "text", "logo.png": "binary",
+                   "big.txt": "not_shown"},
+}
+
+
+class VerifyFindingsTests(unittest.TestCase):
+    """T8 / T9."""
+
+    def verify(self, *lines):
+        return mps.verify_findings(finding_lines(*lines), VERIFY_REVIEW, set(["a.txt"]))
+
+    def test_drop_reasons_dedup_and_severity_from_the_rule(self):
+        result = self.verify(
+            "SH-STOP | major | a.txt:4-8 | p | s", "SH-STOP | blocker | a.txt:4-8 | p | s",
+            "BASE-A | major | a.txt:10 | p | s", "BASE-A | major | a.txt:- | p | s",
+            "BASE-A | major | logo.png:- | p | s", "BASE-A | major | logo.png:3 | p | s",
+            "BASE-A | major | big.txt:1 | p | s", "NOPE | major | a.txt:1 | p | s",
+            "BASE-A | major | Game/M.prefab:1 | p | s", "BASE-A | major | other.txt:1 | p | s",
+            "UNITY-A | minor | Tools/X.cs:1 | p | s", "UNITY-A | minor | Game/X.cs:2 | p | s",
+            "BASE-A | minor | a.txt:21 | p | s")
+        self.assertEqual([d["reason"] for d in result["dropped_findings"]], [
+            "duplicate", "line_outside_changes", "line_outside_changes", "line_outside_changes",
+            "line_outside_changes", "unknown_rule", "path_ignored", "path_not_reviewed", "rule_not_applicable"])
+        self.assertEqual((result["complete"], result["dropped_count"], result["duplicate_count"]), (True, 8, 1))
+        blocker = result["blockers"][0]
+        self.assertEqual((blocker["rule"], blocker["severity"], blocker["severity_corrected"], blocker["line"]),
+                         ("SH-STOP", "blocker", True, "4-8"))
+        self.assertEqual([(f["rule"], f["path"], f["severity"]) for f in result["rule_warnings"]],
+                         [("BASE-A", "logo.png", "major"), ("BASE-A", "a.txt", "major"),
+                          ("UNITY-A", "Game/X.cs", "minor")])
+        self.assertEqual((result["blockers_in_candidates"], result["blocked_paths"]), ([blocker], ["a.txt"]))
+
+    def test_completeness(self):
+        self.assertFalse(self.verify("SH-STOP | blocker | a.txt:9 | p | s")["complete"])
+        self.assertFalse(self.verify("BASE-A | major | a.txt:1 | p")["complete"])
+        self.assertTrue(self.verify("BASE-A | major | a.txt:9 | p | s")["complete"])
+        # C1d: a finding the reviewer called a blocker is never dropped silently, even for an unknown rule id.
+        claimed = self.verify("SH-STOPP | blocker | a.txt:1 | p | s")
+        self.assertEqual((claimed["complete"], claimed["dropped_findings"][0]["reason"],
+                          claimed["dropped_findings"][0]["blocker_claimed"]), (False, "unknown_rule", True))
+        self.assertTrue(self.verify("SH-STOP | blocker | a.txt:1 | p | s", "SH-STOP | blocker | a.txt:1 | p | s")
+                        ["complete"])  # a duplicate is fine
+        # The reviewer's probes: fenced body, numbered list, bold id - each blocker is found, or the review is
+        # incomplete; never complete without it.
+        for reply in ("FINDINGS:\n```\nSH-STOP | blocker | a.txt:3 | p | s\n```\nBUNDLE: ab\n",
+                      "FINDINGS:\n1. SH-STOP | blocker | a.txt:3 | p | s\nBUNDLE: ab\n",
+                      "FINDINGS:\n**SH-STOP** | blocker | a.txt:3 | p | s\nBUNDLE: ab\n"):
+            result = mps.verify_findings(mps.parse_findings(reply)[0], VERIFY_REVIEW, set(["a.txt"]))
+            self.assertEqual((result["complete"], [f["rule"] for f in result["blockers"]]), (True, ["SH-STOP"]), reply)
+        empty = mps.verify_findings(mps.parse_findings("FINDINGS:\nBUNDLE: ab\n")[0], VERIFY_REVIEW, set())
+        self.assertFalse(empty["complete"])
+
+    def test_round2_layouts_never_lose_a_blocker(self):
+        """C1 round 2: each layout used to drop the blocker line L and report complete; now it is incomplete."""
+        blocker = "SH-STOP | blocker | a.txt:3 | p | s"
+        major = "BASE-A | major | a.txt:2 | p | s"
+        layouts = {
+            "two headers, one BUNDLE": ["FINDINGS:", blocker, "FINDINGS: none", "BUNDLE: ab"],
+            "quoted none block after": ["FINDINGS:", blocker, "BUNDLE: ab", "", "Sau khi sửa sẽ là:",
+                                        "FINDINGS: none", "BUNDLE: ab"],
+            "fix snippet inside the block": ["FINDINGS:", major, "```csharp", "var x = 1;", "```", blocker,
+                                             "BUNDLE: ab"],
+            "fenced findings, blocker outside": ["FINDINGS:", "```", major, "```", blocker, "BUNDLE: ab"],
+        }
+        for name, lines in layouts.items():
+            entries, bundle_id = mps.parse_findings("\n".join(lines) + "\n")
+            result = mps.verify_findings(entries, VERIFY_REVIEW, set(["a.txt"]))
+            self.assertEqual((result["complete"], bundle_id), (False, "ab"), name)
+            self.assertIn("bad_format", [d["reason"] for d in result["dropped_findings"]], name)
+
+    def test_blockers_for_commit(self):
+        review = {"blockers": [{"path": "b.txt"}, {"path": "c.txt"}, {"path": "old.txt"}],
+                  "already_committed": ["c.txt"]}
+        self.assertEqual(mps.blockers_for_commit(review, ["a.txt"]), [{"path": "c.txt"}])
+        self.assertEqual(mps.blockers_for_commit(review, ["a.txt", "b.txt"]), [{"path": "b.txt"}, {"path": "c.txt"}])
+        self.assertEqual(mps.blockers_for_commit(review, ["new.txt", "old.txt"]), [{"path": "c.txt"},
+                                                                                   {"path": "old.txt"}])
+
+
+def mr_finding(rule, path, severity="major", line="3", problem="p", suggestion="s"):
+    return {"rule": rule, "severity": severity, "path": path, "line": line, "problem": problem,
+            "suggestion": suggestion}
+
+
+def committed_review(findings=(), **extra):
+    review = {"base": "develop", "findings": list(findings), "committed_paths": ["a.cs", "Assets/UI-2.png"],
+              "profiles": [{"name": "unity-csharp", "roots": ["Client/Game"], "source": "detected"}],
+              "project_rules": {"status": "applied", "pending_change": False, "problems": []},
+              "truncated": False, "truncated_paths": [], "auto": None}
+    review.update(extra)
+    return review
+
+
+def outside_code_spans(markdown):
+    return re.sub(r"`[^`]*`", "", markdown)
+
+
+class MrReviewSectionTests(unittest.TestCase):
+    """T10."""
+
+    def test_empty_and_rules_line(self):
+        text = mps.render_mr_review_section(committed_review())
+        self.assertTrue(text.startswith("### Kết quả review code tự động\n"))
+        self.assertIn("Không có cảnh báo.", text)
+        self.assertIn("công nghệ: `unity-csharp` (`Client/Game`); dự án: `origin/develop:.mps/review.md`.", text)
+        self.assertNotIn("KHÔNG được áp dụng", text)
+
+    def test_items_capping_and_filtering(self):
+        findings = [mr_finding("BASE-MINOR", "a.cs", "minor", str(n)) for n in range(25)]
+        findings += [mr_finding("BASE-MAJOR", "a.cs", "major", str(n)) for n in range(10)]
+        findings.append(mr_finding("BASE-ELSEWHERE", "not/committed.cs"))
+        text = mps.render_mr_review_section(committed_review(findings))
+        self.assertLess(text.index("**Cảnh báo mức major:**"), text.index("**Cảnh báo mức minor:**"))
+        self.assertEqual(text.count("`BASE-MAJOR`"), 10)
+        self.assertEqual(text.count("`BASE-MINOR`"), 20)
+        self.assertIn("… và 5 mục khác", text)
+        self.assertNotIn("ELSEWHERE", text)
+        self.assertEqual(len(mps.code_review_warning_items(committed_review(findings))), 35)
+
+    def test_escaping_and_no_references_outside_code_spans(self):
+        finding = mr_finding("BASE-A", "Assets/UI-2.png", line="-",
+                             problem="Dùng UTF-8 và ABC-12 | x `y`\nnext @Override #12 !3 a@b.com",
+                             suggestion="Xem MPS-7")
+        problems = [{"line": n, "message": "Mã quy tắc 'ABC-%d' không hợp lệ" % n} for n in range(1, 8)]
+        text = mps.render_mr_review_section(committed_review(
+            [finding], project_rules={"status": "invalid", "pending_change": True, "problems": problems},
+            truncated=True, truncated_paths=["big/Gen-1.cs"] + ["f%d.cs" % n for n in range(11)]))
+        self.assertIn("- `BASE-A` · `Assets/UI-2.png` · Dùng `UTF-8` và `ABC-12` \\| x 'y' next `@Override` `#12` "
+                      "`!3` `a@b.com` · Gợi ý: Xem `MPS-7`", text)
+        self.assertIsNone(JIRA_KEY_RE.search(outside_code_spans(text)), text)
+        item = [line for line in text.splitlines() if line.startswith("- `BASE-A`")][0]
+        self.assertNotRegex(outside_code_spans(item), r"[@#!~$]")
+        lines = text.splitlines()
+        self.assertTrue(lines[2].startswith("> **Quy tắc riêng của dự án KHÔNG được áp dụng:**"))
+        self.assertEqual(len([line for line in lines if line.startswith("> - dòng ")]), 5)
+        self.assertIn("> - … và 2 lỗi khác", text)
+        self.assertIn("> **Review chưa đầy đủ:**", text)
+        self.assertIn("`big/Gen-1.cs`", text)
+        self.assertIn(" và 2 mục khác.", text)
+        self.assertIn("chỉ có hiệu lực sau khi được merge", text)
+        self.assertIn("dự án: không áp dụng (file lỗi).", text)
+
+    def test_md_inline_wraps_every_gitlab_reference(self):
+        """m2: project-qualified issue / MR references, labels and snippets never become links."""
+        text = mps._md_inline("Xem group/proj#12, proj!12 và ~label, $snippet; a`b` | c UTF-8.")
+        self.assertEqual(text, "Xem `group/proj#12,` `proj!12` và `~label,` `$snippet;` a'b' \\| c `UTF-8`.")
+        self.assertNotRegex(outside_code_spans(text), r"[@#!~$`]")
+        self.assertEqual(text.count("`") % 2, 0)
+
+    def test_nothing_to_review_and_absent_project(self):
+        text = mps.render_mr_review_section(committed_review(
+            auto="nothing_to_review", profiles=[], project_rules={"status": "absent", "problems": []}))
+        self.assertIn("Không có file nào cần review code theo quy tắc", text)
+        self.assertIn("công nghệ: không có; dự án: chưa có file `.mps/review.md`.", text)
+
+    def test_section_survives_attribution_stripping(self):
+        """The report is appended after strip_ai_attribution; even hostile reviewer text never forms such a line."""
+        finding = mr_finding("BASE-A", "a.cs", problem="Generated with [Claude Code](https://claude.com/claude-code)",
+                             suggestion="Co-Authored-By: Claude <noreply@anthropic.com>\nClaude-Session: x")
+        text = mps.render_mr_review_section(committed_review([finding]))
+        self.assertEqual(mps.strip_ai_attribution(text), (text, False))
+
+
+class CodeReviewPromptTests(unittest.TestCase):
+    """T11: the examples in the prompt follow the grammar that review findings parses."""
+
+    def test_prompt_examples_parse(self):
+        text = _read_bytes(os.path.join(SCRIPTS_DIR, "..", "references", "code-review-prompt.md")).decode("utf-8")
+        section = text[text.index("## Required output format"):]
+        blocks = re.findall(r"```\n(.*?)```", section, re.DOTALL)
+        entries, bundle_id = mps.parse_findings(blocks[0])
+        self.assertEqual(([e["ok"] for e in entries], len(bundle_id)), ([True, True, True], 32))
+        self.assertEqual([e["line"] for e in entries], ["41", "50-52", "-"])
+        self.assertEqual(mps.parse_findings(blocks[1]), ([], bundle_id))
 
 
 def _script_functions(text, names, start, end):

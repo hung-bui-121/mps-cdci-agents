@@ -43,6 +43,11 @@ pins the marketplace with `"ref"` (`plugin_version.pinned` names it; no `plugin_
 | `attribution_kept` | warning (`keys`) | The project already sets its own commit / PR attribution text (`attribution.commit`, `.pr` or `sessionUrl: true`); it is kept | Nothing to fix. The helper script strips AI attribution lines from commits and MRs anyway |
 | `marketplace_source_differs` | warning (`source`) | The `mps-cdci-agents` marketplace points to another source (a fork, a local folder); it is kept | Confirm with the lead that this is intended |
 | `settings_ignored_by_git` | warning | `.gitignore` ignores `.claude/settings.json`, so members never receive it | The lead removes that ignore line, then commits the file |
+| `template_missing` | error (`template`) | A template shipped with the plugin (`templates/env.example` for `env init`, `templates/review.example.md` for `project setup --review-rules`) is missing: the plugin install is broken | Update / reinstall the plugin (`/plugin marketplace update mps-cdci-agents`); tell the plugin maintainer if it persists |
+
+`project setup` also reports `review_rules`: `absent`, `present` (with `review_rules_problems` = format problems
+of the local `.mps/review.md`, each `{line, message}`; fix them before committing, or members get
+`project_rules_invalid` after the merge) or `created` (`--review-rules` wrote the template, which has no active rule).
 
 Bootstrap (step 0) codes such as `python_missing`, `restart_required` or `store_stub_detected` are described in
 `references/setup-environment.md`.
@@ -84,14 +89,14 @@ Bootstrap (step 0) codes such as `python_missing`, `restart_required` or `store_
 | `label_failed` (mr ensure warning) | The label exists but could not be read or added | Add the label by hand on the MR page |
 | `attribution_removed: true` (git commit, mr ensure) | AI attribution lines were dropped: a `Co-Authored-By` with an `@anthropic.com` address or naming only Claude (`Claude`, `Claude Code`, `Claude Opus 5.5`), `Generated with/by [Claude Code](...)`, `Claude-Session:` and a bare `https://claude.ai/code/session...` line. Human co-authors (also one named Claude, e.g. `Claude Martin <...@vng.com.vn>`) and other lines mentioning claude are kept | Nothing to fix; never add them back |
 | `empty_message` (git commit, mr ensure) | The commit message, MR title or MR description is empty (also when it held only AI attribution) | Use the texts from `naming build` |
-| `base_mismatch` (prepare-branch, push) | The ticket branch was made from `recorded_base` and must merge back into it | Use the recorded base. Moving the work to another branch/phase needs a developer |
+| `base_mismatch` (prepare-branch, push, diff-for-review, commit) | The ticket branch was made from `recorded_base` and must merge back into it (diff-for-review and commit also check it because the project's review rules are read from that base) | Use the recorded base. Moving the work to another branch/phase needs a developer |
 | `target_mismatch_recorded_base` (mr ensure) | MR target differs from the branch's recorded base | Use `--target=<recorded_base>`; otherwise ask a developer |
 | `phase_conflict` (flow plan) | The chosen phase differs from the branch that holds the work (changes / unpushed commits on it, or this ticket's own branch) | Explain: changes go back into the branch they were made on; moving them to another phase needs a developer |
 | `phase_required` (flow plan) | Nothing pins the phase (clean tree, personal branch, another ticket's branch) | Ask the user: dev, beta or production; re-run with `--phase=` |
 | `not_latest_release` (flow plan warning) | The user works on an older `release/*` branch that still exists on GitLab | Allowed (the MR goes into that branch) - confirm with the user that this is intended |
 | `explicit_files_required` (commit) | A folder (even a deleted one), `.` or a path that is not a changed file was passed to `--files` | Pass the individual changed files (`changed_files_inside` lists those under the given path) |
 | `scope_review_required` (commit) | No scope review yet, or the branch / HEAD changed since the review | Run the scope review + `review classify` again (SKILL step 6) |
-| `review_stale` (review classify) | The reply does not belong to the latest bundle (`reason`: `no_bundle`, `reply_without_bundle_id`, `reply_for_other_bundle`, `base_changed`) or something changed after the bundle was made (`branch_or_commit_changed`, `files_changed`) | Run `git diff-for-review` again and get a fresh review; never reuse an old reply or add the `BUNDLE:` line by hand |
+| `review_stale` (review classify, review findings) | The reply does not belong to the latest bundle (`reason`: `no_bundle`, `reply_without_bundle_id`, `reply_for_other_bundle`, `base_changed`, `no_code_bundle` = the bundle was made without `--to-file`) or something changed after the bundle was made (`branch_or_commit_changed`, `files_changed`) | Run `git diff-for-review --to-file` again and get fresh replies from BOTH reviewers; never reuse an old reply or add the `BUNDLE:` line by hand |
 | `scope_incomplete` (commit) | The last classification was incomplete (unclassified / unknown / duplicate files, or no VERDICT) | Get a complete reply for the same bundle and run `review classify` again |
 | `nothing_to_commit` with `already_committed` (commit) | Resuming: the requested files are already committed on this branch, other changed files stay uncommitted | Fine - continue with push / MR |
 | `target_ambiguous` (mr ensure) | No recorded base and several protected branches are equally close (e.g. master and a release branch on the same commit); only develop is accepted then | Ask a developer which branch it came from |
@@ -123,6 +128,41 @@ line or the remote URL, and only when both the fetch and push URLs of `origin` a
 Submodules are not fetched/pushed by these commands. This needs git 2.31 or newer; older git ignores it (the
 retry then fails with the same auth error - update git). All git calls run with `LC_ALL=C` / `LANGUAGE=C` so
 error messages can be recognised on Vietnamese-language systems.
+
+## Code review (rules)
+
+The code review checks the changes against the team baseline (`references/review/base.md`), the rules for the
+detected stack (`references/review/profiles/`) and the project's own `.mps/review.md`, read from
+`origin/<base>`. Only a project rule marked `blocker` stops a commit; everything else is a warning.
+
+| error | Meaning | What to do |
+|---|---|---|
+| `code_review_unparsable` (review findings) | The code reviewer's reply has no `FINDINGS:` block | Ask the code reviewer to answer in the format of `code-review-prompt.md` for the same bundle, save the reply again, re-run `review findings` |
+| `code_review_required` (commit; `reason`: `missing`, `other_bundle`, `branch_or_commit_changed`) | No code review yet, or it belongs to an older bundle / commit | Run step 6 again (scope review AND code review of one new bundle) |
+| `code_review_incomplete` (commit; `dropped_count`) | The last code review was not usable as it is (`needs_reviewer_fix` in `review findings`): a malformed line (also `FINDINGS:` with no finding line instead of `FINDINGS: none`); more than one different `FINDINGS:` block, or text / code after the block before `BUNDLE:` (`bad_format`); or a finding on a `blocker` rule (`blocker_rule`) or marked `blocker` by the reviewer (`blocker_claimed`) that does not match the bundle | The code reviewer fixes its reply for the same bundle, quoting `dropped_findings`: "send exactly one FINDINGS block, no code blocks inside, then BUNDLE"; for `blocker_claimed` with `unknown_rule`: "a finding you marked blocker uses an unknown rule id: use an id from section A or drop the line". Re-run `review findings` |
+| `code_review_blocked` (commit; `blockers`) | A rule the project marked `blocker` is broken in a file being committed or already committed on the branch. Nothing was committed or staged | Offer to fix the code (show before / after, edit only with the user's OK, then step 6 again with both reviews). If that is not possible or the user declines: stop, a developer must review. There is no override; never edit `.mps/review.md`, a rule or a reviewer reply |
+
+Warnings (never block):
+
+| warning | Where | Meaning | What to do |
+|---|---|---|---|
+| `project_rules_invalid` (`problems`) | diff-for-review, review findings | `.mps/review.md` on the base branch has format problems (each with `line`, `message`), so the WHOLE file is skipped: only the team and stack rules apply this time | Continue. Say it prominently at the confirm step; the MR report says the project rules were NOT applied. A developer fixes the file on the base branch |
+| `project_rules_pending` | diff-for-review | This change edits `.mps/review.md`; the review still uses the version on the base branch | Tell the user: the new rules apply after the MR is merged |
+| `project_rules_unknown_key` (`keys`) | diff-for-review | The frontmatter of `.mps/review.md` has keys this version does not support (e.g. `disable`); they are ignored | Mention it; the lead removes the key |
+| `project_rule_matches_nothing` (`rule`, `paths`) | diff-for-review (files on the base branch), project setup (tracked files, local `.mps/review.md`) | That project rule's `paths:` match no file, so it never applies. Usually the paths do not start at the repo root (`Assets/...` for a Unity project in `Client/Game/`) | Mention it; the tech lead fixes `paths:` (e.g. `**/Assets/Scripts/**/*.cs`) |
+| `unknown_profile` (`profiles`, `available`) | diff-for-review | `extends:` in `.mps/review.md` names a rule set that does not exist | Mention it; the shipped sets are `python`, `unity-csharp`, `web` |
+| `shipped_blocker_downgraded` (`rules`) | diff-for-review | A rule shipped with the plugin declared `blocker`; it was lowered to `major` (plugin bug) | Mention it; tell the plugin maintainer |
+| `rules_truncated` (`rules`) | diff-for-review | Too many rules for one review: these lower-severity rules were not sent to the reviewer (blocker rules are always sent) | Mention it; the lead can narrow `paths:` or remove rules |
+| `code_bundle_truncated` (`files`) | diff-for-review, review findings | The change is too large: the code reviewer saw only part of it (`truncated_paths`) | Continue; say at the confirm step that the review is partial; the MR report says so too |
+| `code_review_note_failed` (`details`) | mr ensure | The report could not be added as a comment to the existing MR; the MR itself is fine | Mention it; re-running `mr ensure --code-review` later adds it |
+
+`mr ensure --code-review` also returns `code_review_attached: none` with `code_review_reason`: `no_review` (no
+committed code review), `other_branch`, `not_in_branch` (the reviewed commit is not pushed yet - push, then run it
+again), `outdated` (a newer commit on the branch has no code review of its own, e.g. it was made by hand or its
+record could not be saved; the old report is not attached) or `note_failed`.
+
+`internal_error` from `diff-for-review` naming a file under `references/review/` means a rule file shipped with the
+plugin is missing or broken: tell the plugin maintainer.
 
 ## Jira
 

@@ -3,7 +3,8 @@ name: mps-git-flow
 description: >-
   Commit and push code to the MPS self-hosted GitLab (git-gst.mto.zing.vn) with Jira (jira-mps.mto.zing.vn)
   ticket discipline - look up or create the Jira ticket (any board, e.g. MPS or the artist board), create the
-  branch named after it, review that the changes match the ticket scope, commit only the in-scope files, push,
+  branch named after it, review that the changes match the ticket scope and follow the team's and the
+  project's code review rules (.mps/review.md), commit only the in-scope files, push,
   open the merge request (MR) back into the branch the work came from, and update the Jira status. Use when
   the user wants to commit, push code, create a merge request / MR, create a branch for a Jira ticket, or follow
   the MPS project git flow. Vietnamese triggers - "commit code", "đẩy code", "push code lên GitLab", "đưa code
@@ -16,6 +17,10 @@ You help a team member (often NOT a developer) get their changes from the workin
 request that is linked to a Jira ticket, following the team's branch rules. The user's work is precious: never
 lose it, never rewrite shared history, never commit what was not meant for this ticket, and stop to ask
 whenever something is unusual.
+Before anything is committed, the changes are also checked against code review rules: the team's baseline, rules
+for the detected stack (Unity C#, Python, web) and the project's own rules in `.mps/review.md` on the base branch.
+Only a rule the project itself marks `blocker` can stop a commit; everything else is a warning shown to the user
+and written into the merge request.
 
 ## Talking to the user
 
@@ -37,7 +42,7 @@ The CLI is `"<SKILL_DIR>/scripts/mps.py"`; references are in `<SKILL_DIR>/refere
   `--title="..."`, `--description="..."`, `--body="..."`, `--name="..."`, so values that start with `-` still parse.
 - Each call prints ONE JSON object: `{"ok": true, ...}` or `{"ok": false, "error": "<code>", "message": "..."}`
   (non-zero exit). Branch on `error`, not on text.
-- Temp files (Jira description, comments, the reviewer's reply): write them ONLY inside `tmp_dir` from
+- Temp files (Jira description, comments, the reviewers' replies): write them ONLY inside `tmp_dir` from
   `env check` (a folder inside `.git`, never committed), never in the working tree.
 - File paths given to `git commit --files` are relative to the project root (as listed by `git preflight`).
 - Error codes and fixes: `references/troubleshooting.md`; environment / bootstrap codes:
@@ -48,7 +53,7 @@ The CLI is `"<SKILL_DIR>/scripts/mps.py"`; references are in `<SKILL_DIR>/refere
 | `env init [--open]` | create `.env` from the template (never overwrites), make sure git ignores it; gives `fill_guide` |
 | `env check` | validate `.env`, Jira + GitLab tokens, GitLab project, access level, Jira project; gives `tmp_dir`; reports `plugin_outdated` when a newer plugin version exists |
 | `env set KEY VALUE` | save a NON-secret setting (refuses `*_PAT`) |
-| `project setup` | (lead) add the plugin + auto-update to `.claude/settings.json`, make sure `.env` is git-ignored |
+| `project setup [--review-rules]` | (lead) add the plugin + auto-update to `.claude/settings.json`, make sure `.env` is git-ignored; report / scaffold `.mps/review.md` |
 | `jira get KEY` | read a ticket from ANY Jira project |
 | `jira projects` | list Jira projects (boards) the user can see, plus the configured default |
 | `jira create --type=story\|bug --summary=S --description-file=F [--project=KEY] [--field=...]` | create a ticket |
@@ -58,11 +63,12 @@ The CLI is `"<SKILL_DIR>/scripts/mps.py"`; references are in `<SKILL_DIR>/refere
 | `git preflight --base=B --branch=N` | status, branch role + `blockers` (must stop) + `warnings` |
 | `git set-identity --name=N --email=E` | set the repo-local git name/email (only with the user's consent) |
 | `git prepare-branch --base=B --branch=N --key=K [--leave-commits]` | fetch, switch to / create the ticket branch, record its base |
-| `git diff-for-review --base=B --to-file` | write the change bundle (a snapshot with a `Bundle-ID`) for the scope reviewer |
-| `review classify --base=B --result-file=F` | check the reviewer's `FILES:` block, derive commit / exclude lists, save them |
+| `git diff-for-review --base=B --to-file` | write the scope bundle and the code-review bundle (same `Bundle-ID`) + the rules snapshot |
+| `review classify --base=B --result-file=F` | check the scope reviewer's `FILES:` block, derive commit / exclude lists, save them |
+| `review findings --base=B --result-file=F` | check the code reviewer's `FINDINGS:` block against the bundle and the rules, save the result |
 | `git commit --message=M --files f1 f2 ... [--include-out-of-scope f ...]` | commit exactly those reviewed files |
 | `git push --branch=N --base=B` | check every commit vs origin/B for .env/secrets, then push (never forced) |
-| `mr ensure --source=S --target=T --title=X --description=D --key=K --type=story\|bug` | verify target = recorded base, then reuse / create the MR, assigned to the user, labelled Enhancement / Bug |
+| `mr ensure --source=S --target=T --title=X --description=D --key=K --type=story\|bug [--code-review]` | verify target = recorded base, reuse / create the MR (assigned to the user, labelled Enhancement / Bug), add the code-review report |
 
 ## Workflow
 
@@ -236,47 +242,105 @@ repo-local git config (`branch.<branch>.mps-base`), so later steps can enforce "
   and suggest asking a developer (or, with a developer's agreement, a differently named branch).
 - `local_commits_not_carried` -> see the warning above.
 
-### 6. Scope review (before any commit)
+### 6. Scope review + code review (before any commit)
 
-Only what was intentionally changed for this ticket gets committed. Anything else (Unity-regenerated
-`ProjectSettings`/`.meta` files, lock files, someone else's edits, IDE files) stays on the user's machine,
-untouched, and is NOT committed - so it cannot affect other people.
+Two reviews of the same snapshot run side by side:
+- Scope review: only what was intentionally changed for this ticket gets committed. Anything else (Unity-regenerated
+  `ProjectSettings`/`.meta` files, lock files, someone else's edits, IDE files) stays on the user's machine,
+  untouched, and is NOT committed - so it cannot affect other people.
+- Code review: the changes are checked against the rules that apply - the team baseline, the rules for the detected
+  stack (Unity C#, Python, web) and the project's own rules in `.mps/review.md`, always read from the base branch on
+  GitLab (a local edit of that file changes nothing). Findings are warnings; only a rule the project marked
+  `blocker` stops the commit.
 
-1. `git diff-for-review --base=<base_branch> --to-file` -> `bundle_path` (inside `.git`, never committed) and
-   `bundle_id`. The bundle is a snapshot: its header carries `Bundle-ID`, and the script remembers the exact
-   content of every file in it. Section 0 lists the files to classify (`files_to_classify` = uncommitted
-   changes, `already_committed_files` = earlier commits on this branch). `.env` files appear only as
-   "[content hidden]". Do not edit any project file between this step and the commit; if anything must change
-   (e.g. trimming a mixed file), make the change and start again from this step.
-2. Read `references/scope-review-prompt.md`.
-3. Launch ONE subagent with the Agent tool, `subagent_type: "general-purpose"` (do not rely on custom agents;
-   teammates may not have them). Prompt = the full text of scope-review-prompt.md + a "Ticket" block (key, type,
-   summary, description) + "The change bundle is at <bundle_path>; read the whole file with the Read tool."
-   If `truncated` is true, say so in the prompt. The reply must contain `BUNDLE: <id>` with the bundle's id.
-4. Save the reviewer's full reply (as received, never edited by you) to `<tmp_dir>/review.txt` and run
-   `review classify --base=<base_branch> --result-file=<tmp_dir>/review.txt`. It only accepts a reply for the
-   latest bundle while nothing has changed since that bundle, then saves the decisions with the fingerprints
-   the reviewer saw in `<tmp_dir>/scope.json`. `git commit` only accepts files approved there whose content is
-   still exactly what was reviewed. Any edit to a file, or a new commit, means starting step 6 again.
-   - `review_stale` (`reason`: reply for an older bundle, reply without the `BUNDLE:` line, files / branch /
-     HEAD changed since the bundle) -> run `git diff-for-review` again and get a fresh review of the new bundle.
-     Never reuse an old reply and never add the `BUNDLE:` line yourself.
-   - `complete: false` (`unclassified_files`, `unknown_paths`, `duplicate_paths`, missing verdict) or
-     `review_unparsable` -> ask the reviewer (same subagent via SendMessage, or a new one) to fix its reply for
-     the same bundle; never guess. Until the classification is complete, `git commit` refuses with
+1. `git diff-for-review --base=<base_branch> --to-file` -> `bundle_path`, `code_bundle_path` (both inside `.git`,
+   never committed), `bundle_id`, `rules`, `warnings`, `code_review_needed`. The bundles are a snapshot: both
+   headers carry the same `Bundle-ID`, and the script remembers the exact content of every file in it. The scope
+   bundle's section 0 lists the files to classify (`files_to_classify` = uncommitted changes,
+   `already_committed_files` = earlier commits on this branch); `.env` files appear only as "[content hidden]". The
+   code bundle holds the rules (A), the files to check (B) and the changes with line numbers (C). Do not edit any
+   project file between this step and the commit; if anything must change (e.g. trimming a mixed file, fixing a
+   blocker), make the change and start again from this step.
+   Tell the user in one or two plain sentences which rules are used (`rules.profiles`, `rules.project_rules`):
+   - `status: applied` -> team rules + stack rules + the project's own rules.
+   - `status: absent` -> only the team rules and the stack rules ("dự án chưa có file quy tắc riêng").
+   - `status: invalid` (warning `project_rules_invalid`, see `problems`) -> the project's rules file on
+     `<base_branch>` is broken, so this time only the team's common rules are used; a developer should fix
+     `.mps/review.md`. Continue, and show it again in step 7.
+   - `pending_change: true` (warning `project_rules_pending`) -> this change edits `.mps/review.md`; the new rules
+     apply only after the merge request is merged. This review uses the version on `<base_branch>`.
+   - `project_rule_matches_nothing` (`rule`, `paths`): that project rule matches no file on `<base_branch>`, so it
+     never applies (usually its paths do not start at the repo root); mention it - the tech lead fixes the file.
+   - Other warnings (`unknown_profile`, `project_rules_unknown_key`, `rules_truncated`, `code_bundle_truncated`,
+     `shipped_blocker_downgraded`): mention briefly in plain words.
+   - Error `base_mismatch`: `--base` differs from the branch's recorded base (the project rules would be read from
+     the wrong branch); use the base from step 3.
+   - `code_review_needed: false` -> nothing to check against the rules (for example only Unity scenes/prefabs
+     changed); the script already recorded an empty code review. Skip the code reviewer and `review findings` below.
+2. Read `references/scope-review-prompt.md` and (if `code_review_needed`) `references/code-review-prompt.md`.
+3. Launch the reviewers with the Agent tool, `subagent_type: "general-purpose"` (do not rely on custom agents;
+   teammates may not have them). Put BOTH Agent calls in the SAME message so they run in parallel:
+   - Scope reviewer: prompt = the full text of scope-review-prompt.md + a "Ticket" block (key, type, summary,
+     description) + "The change bundle is at <bundle_path>; read the whole file with the Read tool." If `truncated`
+     is true, say so in the prompt.
+   - Code reviewer: prompt = the full text of code-review-prompt.md + the same "Ticket" block + "The code bundle is
+     at <code_bundle_path>; read the whole file with the Read tool." If `code_bundle_truncated` is true, say so.
+   Each reply must contain `BUNDLE: <id>` with the bundle's id.
+4. Save each reply exactly as received (never edited by you): the scope reply to `<tmp_dir>/review.txt`, the code
+   reply to `<tmp_dir>/code_review.txt`. Run
+   `review classify --base=<base_branch> --result-file=<tmp_dir>/review.txt` and
+   `review findings --base=<base_branch> --result-file=<tmp_dir>/code_review.txt`. Both only accept a reply for the
+   latest bundle while nothing has changed since that bundle; they save their results in `<tmp_dir>/scope.json` and
+   `<tmp_dir>/code_review.json`. `git commit` only accepts files approved there whose content is still exactly what
+   was reviewed, and only with a complete code review of the same bundle. Any edit to a file, or a new commit, means
+   starting step 6 again - both reviews.
+   - `review_stale` from either command (`reason`: reply for an older bundle, reply without the `BUNDLE:` line,
+     files / branch / HEAD changed since the bundle, `no_code_bundle`) -> run `git diff-for-review` again and get
+     fresh replies from BOTH reviewers for the new bundle. Never reuse an old reply and never add the `BUNDLE:` line
+     yourself.
+   - `complete: false` from `review classify` (`unclassified_files`, `unknown_paths`, `duplicate_paths`, missing
+     verdict) or `review_unparsable` -> ask the scope reviewer (same subagent via SendMessage, or a new one) to fix
+     its reply for the same bundle; never guess. Until the classification is complete, `git commit` refuses with
      `scope_incomplete` (also for `--include-out-of-scope`). `unclassified_files` are never committed.
+   - `code_review_unparsable`, or `needs_reviewer_fix: true` from `review findings` -> ask the code reviewer
+     (SendMessage, or a new one) to fix its reply for the same bundle, quoting the `dropped_findings` entries; save
+     it again and re-run `review findings`. Until then `git commit` refuses with `code_review_incomplete`. Tell the
+     reviewer what to fix, per `dropped_findings` entry:
+     - `reason: bad_format` with "more than one FINDINGS block ..." or "text between the end of the FINDINGS block
+       and BUNDLE": "send exactly one FINDINGS block, no code blocks inside, then BUNDLE".
+     - other `bad_format` (a line in the wrong format, or `FINDINGS:` with nothing under it): "one finding per line,
+       5 fields separated by |, or exactly `FINDINGS: none`".
+     - `blocker_claimed: true` with `reason: unknown_rule`: "a finding you marked blocker uses an unknown rule id:
+       use an id from section A or drop the line".
+     - `blocker_rule: true` (a finding on a `blocker` rule that does not match the bundle: wrong file, line or path):
+       "cite the file exactly as in section B and a line number printed in section C".
    - Default commit set = `commit_files`: in_scope files, plus concern files when the verdict is PASS.
      `excluded_files` (out_of_scope) are left out.
    - `needs_decision` (concern files under a FAIL verdict) and `concern_files`: show each concern and ask the
      user per file whether to commit it.
    - `mixed_files`: show what part is in / out of scope and ask the user to choose for each file: include the
      whole file, exclude the whole file, or let you remove the out-of-scope part (first show exactly what will
-     be removed, edit only after the user agrees, then run the review + classify again). Never include a mixed
-     file silently.
+     be removed, edit only after the user agrees, then run step 6 again). Never include a mixed file silently.
    - `committed_out_of_scope`: out-of-scope work is already in an earlier commit of this branch; it cannot be
      left out any more - tell the user and suggest a developer.
    - If YOU (the main agent) made out-of-scope changes earlier in this conversation, offer to move them back
      into scope instead.
+   - `rule_warnings` (major, then minor) never block; keep them for step 7. `dropped_count` = findings the script
+     could not match to the bundle (wrong file, line or rule); mention only the number.
+5. Project blockers (`blockers` from `review findings`). For each one, look at its `path`:
+   - The file is in the commit set (`commit_files`, or a file the user wants to include) or in
+     `already_committed_files`: it cannot be committed as it is.
+     1. Explain in plain words: the rule ID and title, `file:line`, the problem, and that this rule is required by
+        the project (set by the tech lead in `.mps/review.md`).
+     2. If you can change the code so it follows the rule, OFFER to do it. Show exactly what will change (the lines
+        before and after; the reviewer's `suggestion` helps). Edit only after the user explicitly agrees.
+     3. After the edit, start step 6 again from 6.1: a new bundle and BOTH reviews.
+     4. If you cannot fix it, the user declines, or the blocker is reported again after the fix: STOP and tell the
+        user that a developer must review this change. There is no way to override a project blocker.
+   - The file stays out of the commit (out of scope / excluded) and was never committed: tell the user. That file
+     cannot be force-included with `--include-out-of-scope` while the blocker stands.
+   - Never edit `.mps/review.md` or any rule, never edit a reviewer reply, and never write `FINDINGS:` or `BUNDLE:`
+     lines to get past a blocker.
 
 ### 7. Confirm
 
@@ -287,6 +351,16 @@ Show a short summary and ask for an explicit "yes":
 - **Sẽ commit:** the exact file list
 - **Không commit (ngoài phạm vi — giữ nguyên trên máy):** every excluded / unclassified file
 - the reviewer verdict and any concerns
+- **Cảnh báo code review (không chặn commit):**
+  - If `project_rules.status` is `invalid`, the FIRST line, clearly: "Quy tắc riêng của dự án KHÔNG được áp dụng
+    lần này vì file .mps/review.md trên nhánh <base_branch> bị lỗi; merge request sẽ ghi rõ điều này. Hãy báo
+    developer sửa file."
+  - If `code_bundle_truncated` is true: "Review code chỉ xem được một phần vì thay đổi quá lớn; các file chưa được
+    xem hết: <truncated_paths>. Merge request cũng sẽ ghi rõ."
+  - `rule_warnings`, major first, then minor: `RULE-ID` - `file:line` - problem - suggestion. "Không có cảnh báo"
+    when empty.
+  - If `dropped_count` > 0, one line: "<n> nhận xét của reviewer không khớp với thay đổi nên đã bị bỏ qua."
+  Warnings never block the commit, and you never leave them out of this summary.
 
 Tell the user they can force-include any excluded file by naming it. Add a file that is not in `commit_files`
 (out-of-scope, mixed kept whole, or a `needs_decision` concern) ONLY if the user explicitly named that specific
@@ -300,21 +374,39 @@ file, and then pass it in both `--files` and `--include-out-of-scope`. Never add
    - `scope_review_required` (no review, or the branch/HEAD changed since) / `changed_since_review` (a file was
      edited after the reviewer saw it) / `scope_incomplete` -> run step 6 again. `not_in_scope` -> the file was
      not approved; ask the user.
+   - `code_review_required` (no code review for this bundle, or it belongs to an older bundle / commit) -> run step
+     6 again (both reviews). `code_review_incomplete` -> get the code reviewer to fix its reply for the same bundle
+     and re-run `review findings`.
+   - `base_mismatch`: the reviews were made against another base than the branch's recorded one; run step 6 again
+     with the recorded base.
+   - `code_review_blocked`: nothing was committed (`blockers` lists rule, file:line, problem). Handle it as in step
+     6.5: offer a fix (edit only with the user's OK, then step 6 again); otherwise stop and send the user to a
+     developer.
    - `explicit_files_required`: a folder, `.` or a path that is not a changed file was passed; list the
      individual changed files instead (`changed_files_inside`).
    - `nothing_to_commit` is fine when resuming an earlier run: either nothing is changed, or the requested files
      are already committed on this branch (`already_committed`) while other files stay uncommitted.
    - `env_file` / `secret_detected`: nothing was committed; explain and stop.
-   - A successful commit consumes the review; a later commit needs a new review.
+   - A successful commit consumes both reviews; a later commit needs step 6 again. The code-review result of this
+     commit is kept for the merge request (step 8.3); `code_review_warning_count` = its warnings on the committed
+     files. `code_review_recorded: false` (rare: the result could not be saved) -> the commit is fine, but the MR
+     will get no code-review report; tell the user.
    - Keep `left_uncommitted` (changed files still not committed) for the final report. Relay
      `unstaged_other_files` if non-empty (files staged earlier that were left out; still changed on disk).
 2. `git push --branch=<branch> --base=<base_branch>`. It refuses `env_file` / `secret_detected` found in any
    commit about to be published, and `base_mismatch` if the base differs from the recorded one.
    `push_rejected` -> explain; never force. Auth errors -> troubleshooting.
 3. `mr ensure --source=<branch> --target=<base_branch> --title="<mr_title>" --description="<mr_description>"
-   --key=<KEY> --type=<story|bug>`. The target is ALWAYS the base the branch was made from, and the phase rules
-   are checked again for it (`phase_rule_violation`: a Story never goes into release/* or master).
+   --key=<KEY> --type=<story|bug> --code-review`. The target is ALWAYS the base the branch was made from, and the
+   phase rules are checked again for it (`phase_rule_violation`: a Story never goes into release/* or master).
    - `existed: true` means the MR was already there.
+   - `code_review_attached`: `description` (new MR: the code-review report is in its description, after
+     `mr_description`), `note` (existing MR: added once as a comment), `already` (already added for this review),
+     `none` (`code_review_reason`: `no_review`, `other_branch`, `not_in_branch` = the reviewed commit is not pushed
+     yet, `outdated` = a newer commit without its own code review is on the branch, `note_failed`). Never write the
+     report into `--description` yourself.
+   - Warning `code_review_note_failed`: the MR is fine, only the comment failed; mention it; re-running
+     `mr ensure` later adds it.
    - The MR is assigned to the user (`assignees`; an existing MR that already has an assignee keeps it) and gets
      the label `Enhancement` (story) or `Bug` (bug, also hotfix) when that label exists on GitLab (`labels`).
      Warnings are non-fatal; relay them: `assign_failed` (assign yourself on the MR page), `label_not_found` (the
@@ -343,12 +435,17 @@ the user what to do by hand on Jira; do not undo the push or the MR.
 Ticket link, branch ("tách từ X -> merge vào X"), MR link, Jira status, and the files left uncommitted
 (`left_uncommitted` from step 8 - still changed on the user's machine, not part of this MR), plus anything the
 user still needs to do by hand.
+Also the code-review result: the number of warnings (`code_review_warning_count`) and where to read them (MR
+description or MR comment). If the project's rules were not applied (`invalid`) or the review was partial
+(truncated), say so again.
 
 ### Resuming
 
 Every step is safe to repeat: `prepare-branch` returns `already_on_branch`, `flow plan` detects the phase from
 the ticket branch's recorded base, `mr ensure` returns the existing MR, `jira transition` is skipped when
 already done. If a run stopped half way, re-run from step 1.
+`git commit` consumes both reviews. The last committed code review is kept for `mr ensure --code-review`, even if
+step 6 runs again before the merge request is created.
 
 ## Hard rules
 
@@ -364,7 +461,11 @@ already done. If a run stopped half way, re-run from step 1.
 - The MR always targets the branch the work was based on; never move changes to another phase's branch.
 - Never add, change or suggest `MPS_GENERATED_PATTERNS` (or any other setting) to get around `phase_conflict`;
   `env set` refuses that key on purpose - only the user edits it in `.env`.
-- Never skip the confirmation step (7); never commit before the scope review (6).
+- Never skip the confirmation step (7); never commit before BOTH reviews of step 6 (scope + code).
+- A project `blocker` is resolved only by fixing the code (with the user's explicit OK, then a fresh step 6) or by
+  a developer. There is no override. Never edit `.mps/review.md`, a rule, or a reviewer reply, and never write
+  `FINDINGS:` / `BUNDLE:` lines yourself.
+- Code-review warnings never block a commit and are never hidden from the user.
 - Never merge, approve or close merge requests - only create them.
 - Never add Claude / AI attribution, co-author trailers (`Co-Authored-By: Claude ...`), `Claude-Session:` trailers,
   claude.ai session links or "Generated with / by Claude Code" lines to commit messages, MR titles or MR
