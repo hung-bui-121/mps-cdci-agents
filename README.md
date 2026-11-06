@@ -16,9 +16,14 @@ Jira (https://jira-mps.mto.zing.vn), kể cả khi bạn không phải developer
 6. Nhờ một trợ lý review xem các thay đổi có đúng phạm vi ticket không. **Chỉ những file thật sự làm cho ticket
    mới được commit**; file ngoài phạm vi (ví dụ Unity tự sửa `ProjectSettings`/`.meta`, file lock, thay đổi của
    người khác) được giữ nguyên trên máy, không commit - để không ảnh hưởng người khác.
-7. Tóm tắt mọi thứ (danh sách "Sẽ commit" và "Không commit") và **chỉ commit + push khi bạn đồng ý**.
-8. Tạo merge request, giao (assign) cho chính bạn và gắn nhãn theo loại ticket (Story -> `Enhancement`, Bug ->
-   `Bug`); cập nhật trạng thái ticket Jira và gắn link MR vào ticket; cuối cùng liệt kê các file còn chưa commit.
+7. Cùng lúc, một trợ lý khác **review code theo quy tắc**: quy tắc chung của team, quy tắc theo công nghệ (Unity
+   C#, Python, web) và quy tắc riêng của dự án trong `.mps/review.md`. Mọi nhận xét chỉ là cảnh báo (ghi vào merge
+   request); chỉ quy tắc mà chính dự án đánh dấu `blocker` mới chặn commit cho tới khi code được sửa.
+8. Tóm tắt mọi thứ (danh sách "Sẽ commit" và "Không commit", cảnh báo code review) và **chỉ commit + push khi bạn
+   đồng ý**.
+9. Tạo merge request, giao (assign) cho chính bạn và gắn nhãn theo loại ticket (Story -> `Enhancement`, Bug ->
+   `Bug`), kèm kết quả review code; cập nhật trạng thái ticket Jira và gắn link MR vào ticket; cuối cùng liệt kê
+   các file còn chưa commit.
 
 Plugin không bao giờ force push, không tự xoá nhánh, không merge MR và không đẩy thẳng vào `develop`, `master`
 hay `release/*`. (MR được tạo với tuỳ chọn "xoá nhánh nguồn": GitLab tự xoá nhánh của ticket sau khi MR được
@@ -116,7 +121,10 @@ Nếu bạn đang có thay đổi trên `release/1.1` thì thay đổi sẽ vào
 nhánh beta mới nhất). Nếu bạn đã sửa code trên một nhánh mà lại chọn giai đoạn khác, Claude sẽ dừng lại và giải
 thích - việc chuyển thay đổi sang giai đoạn khác cần developer. Khi chưa sửa gì, Claude hỏi bạn giai đoạn.
 
-Claude chỉ commit đúng những file đã qua review phạm vi; nếu bạn sửa thêm sau khi review, Claude sẽ review lại.
+Claude chỉ commit đúng những file đã qua review phạm vi và review code; nếu bạn sửa thêm sau khi review, Claude
+sẽ review lại cả hai. Nếu review code phát hiện vi phạm một quy tắc `blocker` của dự án, Claude giải thích và có
+thể đề nghị sửa giúp (chỉ sửa khi bạn đồng ý, rồi review lại); nếu không sửa được, bạn cần nhờ developer. Các cảnh
+báo khác không chặn commit và được ghi vào merge request.
 
 Ví dụ: Story `MPS-123` "Thêm màn hình Đăng nhập bằng Google" -> nhánh
 `feature/MPS-123-them-man-hinh-dang-nhap-bang-google`, commit `feat: MPS-123 Thêm màn hình Đăng nhập bằng Google`,
@@ -176,6 +184,108 @@ với auto-update bật.
 Muốn giữ cố định một phiên bản (không khuyến khích): thêm `"ref": "v0.1.1"` vào `source` của marketplace (cùng cấp
 với `"repo"`). Mặc định là luôn theo bản mới nhất trên `main`. Khi đã ghim `ref`, skill không kiểm tra và không
 nhắc cập nhật phiên bản mới nữa.
+
+## Quy tắc review code theo dự án (dành cho tech lead)
+
+Mỗi lần thành viên đẩy code, một trợ lý review code theo ba lớp quy tắc:
+
+| Lớp | Nguồn | Áp dụng cho |
+|---|---|---|
+| 1. Chung của team | đi kèm plugin (`references/review/base.md`) | mọi file |
+| 2. Theo công nghệ | đi kèm plugin (`references/review/profiles/`): `unity-csharp`, `python`, `web` | tự nhận ra: thư mục có `ProjectSettings/ProjectVersion.txt` (Unity), `pyproject.toml` / `setup.py` / `requirements*.txt` (Python), `package.json` (web); đường dẫn tính từ thư mục đó |
+| 3. Riêng của dự án | file `.mps/review.md` ở gốc repo | do tech lead viết |
+
+**Mức độ:** mọi nhận xét mặc định chỉ là **cảnh báo** (`major`, `minor`), được ghi vào merge request và không chặn
+commit. Chỉ quy tắc mà **chính dự án** đánh dấu `blocker` trong `.mps/review.md` mới chặn commit. Quy tắc đi kèm
+plugin không bao giờ là `blocker`. Khi gặp `blocker`, trợ lý giải thích cho người dùng, có thể đề nghị sửa code
+cho đúng quy tắc (chỉ sửa khi người dùng đồng ý, rồi review lại từ đầu); nếu không sửa được hoặc người dùng không
+đồng ý, người dùng phải nhờ developer. Không có cách nào bỏ qua (override) một `blocker`.
+
+**Đọc từ nhánh gốc:** `.mps/review.md` luôn được đọc từ nhánh gốc trên GitLab (`origin/develop`,
+`origin/release/...` hoặc `origin/master`), không phải bản trên máy. Sửa file quy tắc chỉ có hiệu lực **sau khi
+được merge** (trong lúc đó trợ lý báo `project_rules_pending`).
+
+**File sai định dạng bị bỏ qua cả file:** khi `.mps/review.md` trên nhánh gốc có lỗi (tiêu đề sai dạng, mức độ
+lạ, mã trùng, khối code chưa đóng...), lần review đó chỉ dùng quy tắc lớp 1 và 2, trợ lý cảnh báo
+`project_rules_invalid` và merge request ghi rõ "Quy tắc riêng của dự án KHÔNG được áp dụng". Tech lead cần giữ file
+luôn hợp lệ: chạy `project setup` (hoặc nói "tạo quy tắc review code cho dự án" để dùng skill `mps-project-setup`)
+sẽ báo `review_rules_problems` của bản trên máy trước khi commit.
+
+Tạo file: nói với Claude **"tạo quy tắc review code cho dự án"** hoặc chạy `mps.py project setup --review-rules`
+(tạo `.mps/review.md` từ mẫu, chưa có quy tắc nào có hiệu lực; không bao giờ ghi đè file đã có). Commit file qua
+mps-git-flow như mọi thay đổi khác.
+
+### Cách viết
+
+- Phần đầu file (tuỳ chọn) nằm giữa hai dòng `---`, các khoá:
+  - `version: 1`
+  - `extends: [unity-csharp, web]` - thêm bộ quy tắc có sẵn khi plugin không tự nhận ra công nghệ.
+  - `ignore: **/Assets/ThirdParty/**, Docs/**` - file không cần review code. Bộ `unity-csharp` đã tự bỏ qua file
+    Unity tự sinh (`*.unity`, `*.prefab`, `*.asset`, `*.meta`, `*.mat`, `*.anim`, `*.controller`,
+    `ProjectSettings/**`, `Packages/packages-lock.json`), trừ những file mà một quy tắc của dự án ghi rõ trong dòng
+    `paths:`: quy tắc dự án `paths: **/*.prefab` vẫn được review trên prefab. `ignore` của chính `.mps/review.md`
+    thì luôn thắng (và một quy tắc chỉ khớp file bị `ignore` đó sẽ bị cảnh báo `project_rule_matches_nothing`).
+  - Danh sách viết `a, b` hoặc `[a, b]`; dòng bắt đầu bằng `#` là ghi chú. Phiên bản này chưa có khoá `disable`
+    (khoá lạ chỉ bị cảnh báo `project_rules_unknown_key`).
+- Mỗi quy tắc là một tiêu đề cấp 2: `## MÃ-QUY-TẮC [blocker|major|minor] Tiêu đề`.
+  - Mã: chữ IN HOA, số và dấu `-`; **mỗi phần sau dấu `-` phải bắt đầu bằng chữ cái** (`SH-NO-SYNC-IO`, không
+    được `SH-12` hay `ABC-2-X`), để mã không bao giờ giống mã ticket Jira (GitLab sẽ tự liên kết ticket).
+  - Dòng đầu tiên sau tiêu đề có thể là `paths: **/Assets/Scripts/**/*.cs, Tools/*.cs` (mặc định: mọi file). Mẫu
+    không có `/` (như `*.cs`) khớp tên file ở mọi thư mục; `**` khớp nhiều thư mục. (Khác với
+    `MPS_GENERATED_PATTERNS` trong `.env`, nơi mẫu không có `/` chỉ khớp ở thư mục gốc.)
+  - **`paths:` và `ignore:` luôn tính từ gốc repo**, kể cả khi project Unity nằm trong thư mục con (ví dụ
+    `Client/Game/`): viết `**/Assets/Scripts/**/*.cs` hoặc `Client/Game/Assets/Scripts/**/*.cs`, không viết
+    `Assets/Scripts/**/*.cs` (sẽ không khớp gì). Quy tắc không khớp file nào trên nhánh gốc bị cảnh báo
+    `project_rule_matches_nothing` (khi đẩy code, và khi chạy `project setup` với bản trên máy).
+  - Quy tắc không có `paths:` áp dụng cho mọi file được review, nhưng KHÔNG làm file mà bộ quy tắc có sẵn bỏ qua
+    (prefab, scene, `.meta`...) được review; muốn kiểm tra các file đó thì ghi rõ trong `paths:` (ví dụ
+    `paths: **/*.prefab`).
+  - Phần còn lại giải thích quy tắc, nên có ví dụ Sai / Đúng trong khối code. Tiêu đề `##` nằm trong khối code
+    không bị tính là quy tắc; văn bản trước quy tắc đầu tiên bị bỏ qua.
+- Quy tắc có cùng mã với quy tắc của lớp 1 / 2 sẽ **thay thế** quy tắc đó (ví dụ nâng lên `blocker`).
+
+Ví dụ file `.mps/review.md` đầy đủ:
+
+````markdown
+---
+version: 1
+extends: unity-csharp
+ignore: **/Assets/ThirdParty/**, **/Assets/Generated/**
+---
+
+# Quy tắc review code của dự án (ví dụ)
+
+## SH-NO-SYNC-IO [blocker] Không đọc / ghi file đồng bộ trong Update
+paths: **/Assets/Scripts/**/*.cs
+
+Đọc file đồng bộ mỗi frame làm game đứng hình trên điện thoại. Đọc sẵn lúc load hoặc dùng API bất đồng bộ.
+
+Sai:
+
+```csharp
+void Update() { var json = File.ReadAllText(path); }
+```
+
+Đúng:
+
+```csharp
+async void Start() { _json = await File.ReadAllTextAsync(path); }
+```
+
+## SH-SCORE-ON-SERVER [major] Điểm số chỉ được tính trên server
+paths: **/Assets/Scripts/Battle/**/*.cs
+
+Client chỉ hiển thị điểm do server gửi về, không tự cộng điểm (chống gian lận).
+
+## UNITY-NO-FIND-IN-UPDATE [blocker] Không gọi Find / GetComponent trong Update
+paths: **/*.cs
+
+Dự án này nâng quy tắc có sẵn lên mức chặn commit (cùng mã nên thay thế cả quy tắc của bộ `unity-csharp`, vì vậy
+ghi lại `paths:`).
+````
+
+Các phần sẽ làm sau (chưa có trong bản này): skill `mps-code-review` chạy riêng, chạy review trong GitLab CI, trợ
+lý hỏi đáp để tạo quy tắc, và cách để developer cho phép bỏ qua một `blocker`.
 
 ## Cập nhật plugin
 
@@ -244,8 +354,11 @@ plugins/mps-git-flow/
     scripts/mps.py                         # CLI Python (chỉ thư viện chuẩn), in ra JSON
     scripts/bootstrap.ps1                  # tự kiểm tra / cài Git + Python trên Windows
     scripts/bootstrap.sh                   # tự kiểm tra / cài Git + Python trên macOS / Linux
-    references/                            # luật nhánh, prompt review, chuẩn bị môi trường (setup-environment.md), xử lý lỗi
+    references/                            # luật nhánh, prompt review phạm vi + review code, chuẩn bị môi trường, xử lý lỗi
+    references/review/base.md              # quy tắc review code chung của team (lớp 1)
+    references/review/profiles/            # quy tắc theo công nghệ: unity-csharp, python, web (lớp 2)
     templates/env.example                  # mẫu file .env
+    templates/review.example.md            # mẫu .mps/review.md (project setup --review-rules)
   skills/mps-project-setup/
     SKILL.md                               # cho lead: tích hợp plugin vào project
 tests/test_mps.py                          # unit test (hàm thuần) + test git chạy offline với origin cục bộ
