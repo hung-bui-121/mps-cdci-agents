@@ -25,6 +25,7 @@ if sys.version_info < (3, 8):
 
 import argparse  # noqa: E402
 import base64  # noqa: E402
+import copy  # noqa: E402
 import datetime  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
@@ -33,13 +34,14 @@ import re  # noqa: E402
 import socket  # noqa: E402
 import ssl  # noqa: E402
 import subprocess  # noqa: E402
+import threading  # noqa: E402
 import unicodedata  # noqa: E402
 import uuid  # noqa: E402
 import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 USER_AGENT = "mps-git-flow/" + VERSION
 
 EXIT_FAILURE = 1
@@ -72,6 +74,33 @@ KNOWN_KEYS = (
     KEY_BRANCH_DEV, KEY_BRANCH_BETA_PREFIX, KEY_BRANCH_PROD,
     KEY_CA_BUNDLE, KEY_GENERATED_PATTERNS,
 )
+# The only keys a team member fills in .env; every other key keeps its template default.
+MEMBER_KEYS = (KEY_JIRA_PAT, KEY_JIRA_PROJECT, KEY_GITLAB_PAT)
+SERVICE_PAT_KEYS = {"jira": KEY_JIRA_PAT, "gitlab": KEY_GITLAB_PAT}
+JIRA_PAT_PAGE = "/secure/ViewProfile.jspa?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens"
+# GitLab 16+ pre-fills the token name and scopes from these query parameters.
+GITLAB_PAT_PAGE = "/-/user_settings/personal_access_tokens?name=mps-git-flow&scopes=api,write_repository"
+
+# Plugin integration into a project (lead) and the plugin version check.
+MARKETPLACE_NAME = "mps-cdci-agents"
+MARKETPLACE_REPO = "hung-bui-121/mps-cdci-agents"
+PLUGIN_KEY = "mps-git-flow@mps-cdci-agents"
+PROJECT_SETTINGS_PATH = ".claude/settings.json"
+# Claude Code's `attribution` setting with every part hidden, in the form older Claude Code versions also accept
+# (`"attribution": false` needs v2.1.281+; earlier versions would skip the whole settings file).
+HIDDEN_ATTRIBUTION = {"commit": "", "pr": "", "sessionUrl": False}
+# GitLab label per ticket type (hotfix tickets are bugs).
+MR_LABELS = {"story": "Enhancement", "bug": "Bug"}
+PLUGIN_MANIFEST_URL = ("https://raw.githubusercontent.com/hung-bui-121/mps-cdci-agents/main/"
+                       "plugins/mps-git-flow/.claude-plugin/plugin.json")
+VERSION_CHECK_TIMEOUT_SECONDS = 3
+MANIFEST_MAX_BYTES = 64 * 1024
+DEFAULT_SETTINGS_INDENT = 2
+UPDATE_BLOCKER_ENV = ("DISABLE_UPDATES", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+FORCE_AUTOUPDATE_ENV = "FORCE_AUTOUPDATE_PLUGINS"
+PLUGIN_UPDATE_COMMANDS = ("claude plugin marketplace update " + MARKETPLACE_NAME,
+                          "claude plugin update " + PLUGIN_KEY)
 
 # Files Unity (or the IDE) rewrites on its own. They never make the current branch "hold work" for phase
 # pinning; they are still classified by the scope review and never auto-committed.
@@ -222,6 +251,59 @@ def update_env_text(text, key, value):
     return newline.join(output) + newline
 
 
+_SAVE_TOKEN_STEP = ("Copy token vừa hiện ra, dán ngay sau dấu bằng ở dòng %s trong file .env rồi lưu file. KHÔNG dán "
+                    "token vào khung chat.")
+
+
+def _member_key_guide(key, jira_url, gitlab_url):
+    """(label, steps, link) for one of MEMBER_KEYS. The click path in `steps` is authoritative; links are a shortcut."""
+    if key == KEY_JIRA_PAT:
+        return ("Token Jira (%s)" % key, [
+            "Mở link bên dưới (hoặc trên Jira: bấm ảnh đại diện góc phải > Profile > Personal Access Tokens).",
+            "Bấm Create token, đặt tên (ví dụ mps-git-flow), chọn ngày hết hạn theo quy định của team, bấm Create.",
+            _SAVE_TOKEN_STEP % key,
+        ], jira_url.rstrip("/") + JIRA_PAT_PAGE)
+    if key == KEY_GITLAB_PAT:
+        return ("Token GitLab (%s)" % key, [
+            "Mở link bên dưới: GitLab bản mới tự điền sẵn tên token (mps-git-flow) và hai quyền api, write_repository.",
+            "Nếu trang không điền sẵn: trên GitLab bấm ảnh đại diện > Edit profile > Access Tokens, bấm Add new token, "
+            "đặt tên mps-git-flow, tích hai quyền (scope) api và write_repository.",
+            "Chọn ngày hết hạn theo quy định của team rồi bấm Create.",
+            _SAVE_TOKEN_STEP % key,
+        ], gitlab_url.rstrip("/") + GITLAB_PAT_PAGE)
+    return ("Mã board Jira của team (%s)" % key, [
+        "Đây là mã board Jira của team, ví dụ MPS. Hỏi lead nếu chưa biết.",
+        "Điền mã ngay sau dấu bằng ở dòng %s trong file .env rồi lưu file." % key,
+        "Chưa biết mã thì cứ để trống: trợ lý sẽ gợi ý danh sách board để bạn chọn.",
+    ], None)
+
+
+def env_fill_guide(cfg_values, jira_url, gitlab_url, keys=None, token_rejected=False):
+    """Ordered [{key, label, steps, link}] telling a member how to fill .env by hand.
+
+    keys None = the MEMBER_KEYS still blank in `cfg_values`. Other keys (deleted lines) get one step that restores
+    the template default. `token_rejected` adds a first step saying the current token is wrong or expired.
+    Token values are only tested for blankness, never copied into the output.
+    """
+    if keys is None:
+        keys = [k for k in MEMBER_KEYS if not (cfg_values.get(k) or "").strip()]
+    order = list(MEMBER_KEYS) + [k for k in KNOWN_KEYS if k not in MEMBER_KEYS]
+    ordered = [k for k in order if k in keys] + [k for k in keys if k not in order]
+    guide = []
+    for key in ordered:
+        if key in MEMBER_KEYS:
+            label, steps, link = _member_key_guide(key, jira_url, gitlab_url)
+        elif key in DEFAULTS:
+            label, steps, link = key, ["Khôi phục dòng mặc định trong file .env: %s=%s" % (key, DEFAULTS[key])], None
+        else:
+            label, steps, link = key, ["Điền %s trong file .env theo hướng dẫn của lead." % key], None
+        if token_rejected and key.endswith(SECRET_KEY_SUFFIX):
+            steps = ["Token hiện tại sai hoặc đã hết hạn - tạo token mới theo các bước dưới và thay vào dòng %s trong "
+                     "file .env." % key] + steps
+        guide.append({"key": key, "label": label, "steps": steps, "link": link})
+    return guide
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers: naming
 # ---------------------------------------------------------------------------
@@ -279,6 +361,187 @@ def build_names(key, kind, title):
         "mr_title": commit_message[len(commit_prefix):],
         "mr_description": "Close " + issue_key,
     }
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers: AI attribution
+# ---------------------------------------------------------------------------
+
+# The exact forms an AI assistant appends to commits / MR descriptions, and nothing else: a human co-author named
+# Claude ("Claude Martin <claude.martin@...>"), a subject such as "claude-api: bump SDK" or a sentence mentioning
+# claude are never matched.
+_AI_ATTRIBUTION_RES = (
+    # Any co-author trailer with an anthropic.com address.
+    re.compile(r"^\s*co-authored-by\s*:.*<[^>]*@anthropic\.com>\s*$", re.IGNORECASE),
+    # "Co-Authored-By: Claude", "Claude Code", "Claude Opus 5.5", ... with an optional address.
+    re.compile(r"^\s*co-authored-by\s*:\s*claude(\s+(code|opus|sonnet|haiku|fable|\d[\w.]*))*\s*(<[^>]*>)?\s*$",
+               re.IGNORECASE),
+    # "Generated with [Claude Code](https://...)" / "Generated by Claude Code", optionally after an emoji.
+    re.compile(r"^\s*(?:[^\w\s]+\s*)?generated\s+(with|by)\s+\[?claude(\s+code)?\]?(\(https?://[^)]*\))?\.?\s*$",
+               re.IGNORECASE | re.UNICODE),
+    re.compile(r"^\s*claude-session\s*:", re.IGNORECASE),
+    re.compile(r"^\s*https?://claude\.ai/code/session[\w/-]*\s*$", re.IGNORECASE),
+)
+
+
+def strip_ai_attribution(text):
+    """Remove Claude / AI attribution lines. Returns (text, removed).
+
+    Only matching lines are dropped; trailing blank lines are then trimmed. Text without such lines is returned
+    unchanged (removed False).
+    """
+    lines = (text or "").splitlines()
+    kept = [line for line in lines if not any(regex.search(line) for regex in _AI_ATTRIBUTION_RES)]
+    if len(kept) == len(lines):
+        return text or "", False
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join(kept), True
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers: project integration
+# ---------------------------------------------------------------------------
+
+_BOM = chr(0xFEFF)
+
+
+def parse_settings_text(text):
+    """.claude/settings.json text -> dict. A leading BOM is accepted; empty or whitespace-only text is {}."""
+    if text.startswith(_BOM):
+        text = text[len(_BOM):]
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        line = getattr(exc, "lineno", None)
+        column = getattr(exc, "colno", None)
+        raise MpsError("settings_invalid_json",
+                       "File %s không phải JSON hợp lệ (dòng %s, cột %s). Chưa sửa gì. Hãy nhờ developer sửa file rồi "
+                       "chạy lại." % (PROJECT_SETTINGS_PATH, line, column), line=line, column=column)
+    if not isinstance(data, dict):
+        raise MpsError("settings_not_object", "File %s phải là một object JSON ({...}). Chưa sửa gì. Hãy nhờ developer "
+                                              "kiểm tra." % PROJECT_SETTINGS_PATH)
+    return data
+
+
+def _settings_conflict(key):
+    return MpsError("settings_conflict",
+                    "Mục %s trong %s có dạng không mong đợi nên không thể tự thêm plugin. Chưa sửa gì. Hãy nhờ "
+                    "developer kiểm tra." % (key, PROJECT_SETTINGS_PATH), key=key)
+
+
+def _expected_marketplace_source():
+    return {"source": "github", "repo": MARKETPLACE_REPO}
+
+
+def _describe_source(source):
+    if isinstance(source, dict):
+        for field in ("repo", "url", "path"):
+            if source.get(field):
+                return str(source[field])
+    return json.dumps(source, ensure_ascii=False, sort_keys=True)
+
+
+def merge_project_settings(settings):
+    """Add the marketplace (auto-update on) and enable the plugin. Returns (new_settings, changes, warnings).
+
+    The input is never mutated; existing keys keep their order and new keys are appended. A marketplace entry with
+    another source (a fork, a local directory) is kept as it is and reported.
+    """
+    merged = copy.deepcopy(settings)
+    changes = []
+    warnings = []
+    marketplaces = merged.setdefault("extraKnownMarketplaces", {})
+    if not isinstance(marketplaces, dict):
+        raise _settings_conflict("extraKnownMarketplaces")
+    entry = marketplaces.get(MARKETPLACE_NAME)
+    if entry is None and MARKETPLACE_NAME not in marketplaces:
+        marketplaces[MARKETPLACE_NAME] = {"source": _expected_marketplace_source(), "autoUpdate": True}
+        changes.append("marketplace_added")
+    else:
+        if not isinstance(entry, dict):
+            raise _settings_conflict("extraKnownMarketplaces." + MARKETPLACE_NAME)
+        source = entry.get("source")
+        unpinned = dict((k, v) for k, v in source.items() if k != "ref") if isinstance(source, dict) else source
+        if unpinned != _expected_marketplace_source():
+            warnings.append({"code": "marketplace_source_differs", "source": source,
+                             "message": "Marketplace %s trong %s đang trỏ tới nguồn khác (%s); giữ nguyên nguồn đó."
+                                        % (MARKETPLACE_NAME, PROJECT_SETTINGS_PATH, _describe_source(source))})
+        if entry.get("autoUpdate") is not True:
+            entry["autoUpdate"] = True
+            changes.append("auto_update_enabled")
+    enabled = merged.setdefault("enabledPlugins", {})
+    if not isinstance(enabled, dict):
+        raise _settings_conflict("enabledPlugins")
+    if enabled.get(PLUGIN_KEY) is not True:
+        enabled[PLUGIN_KEY] = True
+        changes.append("plugin_enabled")
+    _merge_attribution(merged, changes, warnings)
+    return merged, changes, warnings
+
+
+def _merge_attribution(merged, changes, warnings):
+    """Hide Claude Code's commit / PR attribution for the project. Only missing sub-keys are added; values the
+    project already set are kept (and reported when they still add attribution). `false` already hides it all."""
+    if "attribution" not in merged:
+        merged["attribution"] = dict(HIDDEN_ATTRIBUTION)
+        changes.append("attribution_disabled")
+        return
+    attribution = merged["attribution"]
+    if attribution is False:
+        return
+    if not isinstance(attribution, dict):
+        raise _settings_conflict("attribution")
+    missing = [key for key in HIDDEN_ATTRIBUTION if key not in attribution]
+    for key in missing:
+        attribution[key] = HIDDEN_ATTRIBUTION[key]
+    if missing:
+        changes.append("attribution_disabled")
+    kept = [key for key in ("commit", "pr") if attribution.get(key)]
+    if attribution.get("sessionUrl") is True:
+        kept.append("sessionUrl")
+    if kept:
+        warnings.append({"code": "attribution_kept", "keys": kept,
+                         "message": "Mục attribution trong %s đang đặt sẵn nội dung ghi công (%s); giữ nguyên. Script "
+                                    "vẫn tự gỡ các dòng ghi công AI khỏi commit và merge request."
+                                    % (PROJECT_SETTINGS_PATH, ", ".join(kept))})
+
+
+_INDENTED_LINE_RE = re.compile(r"\n([ \t]+)\S")
+
+
+def detect_json_indent(text):
+    """Indent unit of existing JSON text (a number of spaces, or a tab); DEFAULT_SETTINGS_INDENT when nothing is
+    indented. The first indented line of pretty-printed JSON is one level deep."""
+    match = _INDENTED_LINE_RE.search(text or "")
+    if not match:
+        return DEFAULT_SETTINGS_INDENT
+    unit = match.group(1)
+    return "\t" if "\t" in unit else len(unit)
+
+
+def render_settings_json(settings, newline, indent=DEFAULT_SETTINGS_INDENT):
+    """Indented JSON (spaces or a tab), non-ASCII kept as is, `newline` line endings, ending with a newline."""
+    return json.dumps(settings, indent=indent, ensure_ascii=False).replace("\n", newline) + newline
+
+
+def project_integration_status(settings):
+    """"integrated" when the settings enable the plugin, else "missing"."""
+    enabled = settings.get("enabledPlugins") if isinstance(settings, dict) else None
+    if isinstance(enabled, dict) and enabled.get(PLUGIN_KEY) is True:
+        return "integrated"
+    return "missing"
+
+
+def pinned_marketplace_ref(settings):
+    """The `ref` the project pins the mps-cdci-agents marketplace source to (e.g. "v0.1.1"), or None."""
+    marketplaces = settings.get("extraKnownMarketplaces") if isinstance(settings, dict) else None
+    entry = marketplaces.get(MARKETPLACE_NAME) if isinstance(marketplaces, dict) else None
+    source = entry.get("source") if isinstance(entry, dict) else None
+    ref = source.get("ref") if isinstance(source, dict) else None
+    return ref.strip() if isinstance(ref, str) and ref.strip() else None
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +776,48 @@ def sort_release_branches(branches, prefix):
         return sorted(candidates, key=lambda b: (parse_release_version(b["name"], prefix), _branch_date(b)),
                       reverse=True)
     return sorted(candidates, key=_branch_date, reverse=True)
+
+
+_PLUGIN_VERSION_RE = re.compile(r"^v?([0-9]+)\.([0-9]+)\.([0-9]+)$")
+
+
+def parse_plugin_version(text):
+    """'0.1.10' / 'v0.2.0' -> (0, 1, 10); anything else (None, '', '1.x', '1.2') -> None."""
+    if not isinstance(text, str):
+        return None
+    match = _PLUGIN_VERSION_RE.match(text.strip())
+    return tuple(int(n) for n in match.groups()) if match else None
+
+
+def is_newer_version(latest, running):
+    """True if version string `latest` is newer than `running`; False if either does not parse."""
+    latest_tuple = parse_plugin_version(latest)
+    running_tuple = parse_plugin_version(running)
+    if latest_tuple is None or running_tuple is None:
+        return False
+    return latest_tuple > running_tuple
+
+
+def update_blockers(environ):
+    """Environment variables (set, non-empty) that stop Claude Code from updating plugins by itself."""
+    if environ.get(FORCE_AUTOUPDATE_ENV) == "1":
+        return []
+    return [name for name in UPDATE_BLOCKER_ENV if environ.get(name)]
+
+
+def plugin_outdated_warning(latest, running, blockers):
+    return {"code": "plugin_outdated", "latest": latest, "running": running, "update_blockers": blockers,
+            "commands": list(PLUGIN_UPDATE_COMMANDS),
+            "message": "Đã có phiên bản mới của plugin mps-git-flow (%s; máy bạn đang dùng %s). Trợ lý sẽ cập nhật "
+                       "giúp; bản mới có hiệu lực sau khi gõ /reload-plugins hoặc mở lại Claude Code."
+                       % (latest, running)}
+
+
+def project_not_integrated_warning():
+    return {"code": "project_not_integrated",
+            "message": "Project này chưa khai báo plugin mps-git-flow trong %s nên đồng đội không tự có plugin và bản "
+                       "cập nhật. Lead của dự án có thể nhờ Claude \"tích hợp plugin vào project\"."
+                       % PROJECT_SETTINGS_PATH}
 
 
 # ---------------------------------------------------------------------------
@@ -1321,6 +1626,45 @@ def build_ssl_context(cfg):
     return ssl.create_default_context(cafile=path)
 
 
+def fetch_latest_plugin_version(cfg, environ=None):
+    """Version in the plugin.json on GitHub main, or None. Best effort: never raises, at most one short request.
+
+    Runs in a daemon thread that is given VERSION_CHECK_TIMEOUT_SECONDS in total, because the socket timeout does
+    not cover a slow DNS lookup. Skipped when the user turned non-essential traffic off.
+    """
+    environ = os.environ if environ is None else environ
+    if environ.get(NONESSENTIAL_TRAFFIC_ENV):
+        return None
+    found = []
+    worker = threading.Thread(target=lambda: found.append(_fetch_manifest_version(cfg)))
+    worker.daemon = True
+    worker.start()
+    worker.join(VERSION_CHECK_TIMEOUT_SECONDS)
+    return found[0] if found else None
+
+
+def _fetch_manifest_version(cfg):
+    """Trusts the public CAs plus MPS_CA_BUNDLE (TLS-inspecting company proxies), unlike build_ssl_context, which
+    trusts only the bundle. Any failure gives None."""
+    try:
+        context = ssl.create_default_context()
+        ca_bundle = cfg.get(KEY_CA_BUNDLE)
+        if ca_bundle:
+            path = ca_bundle if os.path.isabs(ca_bundle) else os.path.join(cfg.root, ca_bundle)
+            if os.path.isfile(path):
+                context.load_verify_locations(path)
+        opener = urllib.request.build_opener(_NoRedirectHandler(), urllib.request.HTTPSHandler(context=context))
+        request = urllib.request.Request(PLUGIN_MANIFEST_URL, headers={"User-Agent": USER_AGENT})
+        with opener.open(request, timeout=VERSION_CHECK_TIMEOUT_SECONDS) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read(MANIFEST_MAX_BYTES).decode("utf-8"))
+    except Exception:  # noqa: BLE001 - offline, proxy, TLS, HTTP or JSON errors all mean "unknown"
+        return None
+    version = data.get("version") if isinstance(data, dict) else None
+    return version.strip() if parse_plugin_version(version) is not None else None
+
+
 def _require_https(cfg, key):
     url = cfg.get(key)
     if not url.lower().startswith("https://"):
@@ -1396,9 +1740,16 @@ class Config(object):
     def require(self, *keys):
         missing = [k for k in keys if not self.get(k)]
         if missing:
-            raise MpsError("missing_config", "File .env còn thiếu: %s. Hãy tự mở file .env bằng trình soạn thảo "
-                                             "để điền (không dán token vào chat)." % ", ".join(missing),
-                           missing_keys=missing, env_path=self.env_path)
+            raise self.missing_config_error(missing)
+
+    def fill_guide(self, keys=None, token_rejected=False):
+        return env_fill_guide(self.values, self.get(KEY_JIRA_URL), self.get(KEY_GITLAB_URL), keys=keys,
+                              token_rejected=token_rejected)
+
+    def missing_config_error(self, missing, **extra):
+        return MpsError("missing_config", "File .env còn thiếu: %s. Hãy tự mở file .env bằng trình soạn thảo "
+                                          "để điền (không dán token vào chat)." % ", ".join(missing),
+                        missing_keys=missing, env_path=self.env_path, fill_guide=self.fill_guide(keys=missing), **extra)
 
     def branches(self):
         return {"dev": self.get(KEY_BRANCH_DEV), "beta_prefix": self.get(KEY_BRANCH_BETA_PREFIX),
@@ -1846,6 +2197,39 @@ def env_is_tracked(root):
     return bool(run_git(["ls-files", "--", ENV_FILENAME], root, check=False).stdout.strip())
 
 
+def project_settings_path(root):
+    return os.path.join(root, *PROJECT_SETTINGS_PATH.split("/"))
+
+
+def load_project_settings(root):
+    """<root>/.claude/settings.json as a dict, or None when it is missing, unreadable or not a JSON object."""
+    path = project_settings_path(root)
+    if not os.path.isfile(path):
+        return None
+    try:
+        return parse_settings_text(read_text_file(path))
+    except (MpsError, OSError):
+        return None
+
+
+def project_settings_status(root):
+    """project_integration_status of <root>/.claude/settings.json; a missing or unreadable file counts as "missing"."""
+    return project_integration_status(load_project_settings(root))
+
+
+def write_file_atomically(path, data):
+    """Write bytes through a temp file in the same folder, so a crash never leaves a half-written file."""
+    temp = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(temp, "wb") as handle:
+            handle.write(data)
+        os.replace(temp, path)
+    except OSError:
+        if os.path.exists(temp):
+            os.remove(temp)
+        raise
+
+
 def git_network_env(cfg, with_token):
     env = git_base_env()
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -2026,20 +2410,56 @@ def cmd_env_init(args):
             dst.write(content)
         created = True
     gitignore_updated = ensure_env_gitignored(root)
-    result = {"env_path": env_path, "created": created, "gitignore_updated": gitignore_updated}
+    # Only the member keys still blank in the resulting .env (an existing, filled .env gives an empty guide).
+    guide = load_config(root).fill_guide()
+    result = {"env_path": env_path, "created": created, "gitignore_updated": gitignore_updated,
+              "fill_guide": guide, "keys_to_fill": [entry["key"] for entry in guide]}
     if args.open:
         result["opened_in_editor"] = open_in_editor(env_path)
     return result
 
 
+def _plugin_version_status(cfg, pinned_ref):
+    """({running, latest, checked[, pinned]}, warnings). An unreachable GitHub only gives checked: false.
+
+    A project that pins the marketplace to a `ref` chose that version on purpose: no lookup, no plugin_outdated.
+    """
+    if pinned_ref:
+        return {"running": VERSION, "latest": None, "checked": False, "pinned": pinned_ref}, []
+    latest = fetch_latest_plugin_version(cfg)
+    info = {"running": VERSION, "latest": latest, "checked": latest is not None}
+    warnings = []
+    if is_newer_version(latest, VERSION):
+        warnings.append(plugin_outdated_warning(latest, VERSION, update_blockers(os.environ)))
+    return info, warnings
+
+
 def cmd_env_check(args):
     root = find_project_root()
     cfg = load_config(root)
+    settings = load_project_settings(root)
+    version_info, warnings = _plugin_version_status(cfg, pinned_marketplace_ref(settings))
+    if project_integration_status(settings) != "integrated":
+        warnings.append(project_not_integrated_warning())
+    try:
+        result = _check_env(root, cfg, warnings)
+    except MpsError as exc:
+        pat_key = SERVICE_PAT_KEYS.get(exc.extra.get("service"))
+        if exc.code == "auth_failed" and pat_key:
+            exc.extra.setdefault("fill_guide", cfg.fill_guide(keys=[pat_key], token_rejected=True))
+        # The agent handles plugin_outdated before fixing the error, so errors carry the warnings too.
+        exc.extra.setdefault("warnings", warnings)
+        exc.extra.setdefault("plugin_version", version_info)
+        raise
+    result["plugin_version"] = version_info
+    return result
+
+
+def _check_env(root, cfg, warnings):
     if not cfg.env_exists:
         raise MpsError("env_missing", "Chưa có file .env ở thư mục gốc project. Hãy chạy: env init --open",
-                       env_path=cfg.env_path)
+                       env_path=cfg.env_path, next="env init --open")
     gitignore_updated = ensure_env_gitignored(root)
-    warnings = []
     if env_is_tracked(root):
         warnings.append({"code": "env_tracked", "message": "File .env đang bị git theo dõi (đã từng được commit). "
                                                            "Cần developer gỡ nó khỏi git (git rm --cached .env) "
@@ -2049,9 +2469,7 @@ def cmd_env_check(args):
         warnings.append(invalid_generated_warning(rejected_patterns))
     missing = [k for k in REQUIRED_CONNECTION_KEYS if not cfg.get(k)]
     if missing:
-        raise MpsError("missing_config", "File .env còn thiếu: %s. Hãy tự mở file .env bằng trình soạn thảo để điền "
-                                         "(không dán token vào chat)." % ", ".join(missing),
-                       missing_keys=missing, env_path=cfg.env_path, gitignore_updated=gitignore_updated)
+        raise cfg.missing_config_error(missing, gitignore_updated=gitignore_updated)
     jira = jira_client(cfg)
     me = jira.get("/rest/api/2/myself") or {}
     gitlab = gitlab_client(cfg)
@@ -2111,6 +2529,58 @@ def cmd_env_set(args):
     with open(cfg.env_path, "wb") as handle:
         handle.write(new_text.encode("utf-8"))
     return {"env_path": cfg.env_path, "key": key, "value": value}
+
+
+# ---------------------------------------------------------------------------
+# Commands: project (lead)
+# ---------------------------------------------------------------------------
+
+PROJECT_SETUP_FILES = (PROJECT_SETTINGS_PATH, ".gitignore")
+
+
+def _read_project_settings_text(path):
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise MpsError("settings_invalid_json",
+                       "File %s không phải JSON hợp lệ (không đọc được dạng UTF-8). Chưa sửa gì. Hãy nhờ developer sửa "
+                       "file rồi chạy lại." % PROJECT_SETTINGS_PATH, line=None, column=None)
+
+
+def cmd_project_setup(args):
+    """Integrate the plugin into the project for every member: settings.json entries (auto-update on), .env ignored.
+
+    Only the marketplace / enabledPlugins entries are added; every other key and its order are kept, and so are the
+    file's line endings and indent. Nothing is written when the file is not valid JSON or already integrated.
+    """
+    root = find_project_root()
+    path = project_settings_path(root)
+    created = not os.path.isfile(path)
+    text = "" if created else _read_project_settings_text(path)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    merged, changes, warnings = merge_project_settings(parse_settings_text(text))
+    if changes:
+        folder = os.path.dirname(path)
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+        rendered = render_settings_json(merged, newline, detect_json_indent(text))
+        write_file_atomically(path, rendered.encode("utf-8"))
+    gitignore_updated = ensure_env_gitignored(root)
+    # A file git already tracks is committed whatever .gitignore says.
+    tracked = run_git(["ls-files", "--error-unmatch", "--", PROJECT_SETTINGS_PATH], root, check=False).ok
+    if not tracked and run_git(["check-ignore", "-q", "--no-index", PROJECT_SETTINGS_PATH], root,
+                               check=False).code == 0:
+        warnings.append({"code": "settings_ignored_by_git",
+                         "message": "File %s đang bị .gitignore bỏ qua nên thành viên sẽ không nhận được. Cần bỏ dòng "
+                                    "ignore tương ứng rồi commit file." % PROJECT_SETTINGS_PATH})
+    written = {PROJECT_SETTINGS_PATH: bool(changes), ".gitignore": gitignore_updated}
+    pending = set(_changed_paths(git_status(root)))
+    files_to_commit = [p for p in PROJECT_SETUP_FILES if written[p] or p in pending]
+    return {"settings_path": path, "created": created, "changed": bool(changes), "changes": changes,
+            "gitignore_updated": gitignore_updated, "files_to_commit": files_to_commit, "warnings": warnings,
+            "next": "commit_with_mps_git_flow" if files_to_commit else None}
 
 
 # ---------------------------------------------------------------------------
@@ -2766,7 +3236,8 @@ def cmd_git_commit(args):
     status = git_status(root)
     if status["unmerged"]:
         raise_unmerged(status["unmerged"])
-    message = args.message
+    # Enforced here, whatever the agent was told: no AI attribution / co-author trailers in team commits.
+    message, attribution_removed = strip_ai_attribution(args.message)
     if not message.strip():
         raise MpsError("empty_message", "Nội dung commit đang trống.")
     requested = [normalize_target_path(f) for f in args.files]
@@ -2839,8 +3310,8 @@ def cmd_git_commit(args):
     sha = run_git(["rev-parse", "HEAD"], root).stdout.strip()
     files = [line for line in run_git(["show", "--name-status", "--format=", "HEAD"], root).stdout.splitlines()
              if line.strip()]
-    return {"branch": branch, "commit": sha, "message": message, "files": files, "unstaged_other_files": outside,
-            "left_uncommitted": _changed_paths(git_status(root))}
+    return {"branch": branch, "commit": sha, "message": message, "attribution_removed": attribution_removed,
+            "files": files, "unstaged_other_files": outside, "left_uncommitted": _changed_paths(git_status(root))}
 
 
 def _already_committed(root, branch, paths):
@@ -2953,9 +3424,122 @@ def _find_open_mr(gitlab, project_id, source):
     return found[0] if found else None
 
 
+# Refusals of an optional MR update (assignee, label): reported as warnings, never fatal.
+_MR_UPDATE_REFUSED = (400, 401, 403, 404, 409, 422)
+
+
+def match_label_name(labels, wanted):
+    """Exact name of the label whose name equals `wanted` ignoring case (labels: [{"name"}] or names), or None."""
+    target = (wanted or "").strip().casefold()
+    for label in labels or []:
+        name = label.get("name") if isinstance(label, dict) else label
+        if isinstance(name, str) and name.strip().casefold() == target:
+            return name
+    return None
+
+
+def mr_assignee_usernames(mr):
+    assignees = mr.get("assignees") or ([mr["assignee"]] if mr.get("assignee") else [])
+    return [a.get("username") for a in assignees if isinstance(a, dict)]
+
+
+def _assign_failed_warning(details):
+    return {"code": "assign_failed", "details": details,
+            "message": "Không tự giao (assign) được merge request cho bạn. Hãy tự assign trên trang MR."}
+
+
+def _label_warning(code, label, details=None):
+    if code == "label_not_found":
+        message = ("Project GitLab chưa có nhãn (label) \"%s\" nên merge request chưa được gắn nhãn. Hãy nhờ lead tạo "
+                   "nhãn này, hoặc tự chọn nhãn trên trang MR." % label)
+    else:
+        message = "Không gắn được nhãn \"%s\" cho merge request. Hãy tự gắn nhãn trên trang MR." % label
+    return {"code": code, "label": label, "details": details, "message": message}
+
+
+def _current_gitlab_user(gitlab, warnings):
+    """The token's GitLab user (for "assign to me"), or None with an assign_failed warning."""
+    try:
+        user = gitlab.get("/user") or {}
+    except MpsError as exc:
+        warnings.append(_assign_failed_warning(exc.message))
+        return None
+    if not user.get("id"):
+        warnings.append(_assign_failed_warning("GitLab /user returned no id"))
+        return None
+    return user
+
+
+def find_gitlab_label(gitlab, project_id, wanted, warnings):
+    """Exact name of an EXISTING project / group label matching `wanted` ignoring case, or None with a warning.
+
+    The label is never created: GitLab would otherwise create a new, differently cased one on the fly.
+    """
+    try:
+        labels = gitlab_get_all(gitlab, "/projects/%s/labels" % project_id,
+                                {"search": wanted, "include_ancestor_groups": "true"})
+    except MpsError as exc:
+        warnings.append(_label_warning("label_failed", wanted, exc.message))
+        return None
+    name = match_label_name(labels, wanted)
+    if name is None:
+        warnings.append(_label_warning("label_not_found", wanted))
+    return name
+
+
+def _update_mr(gitlab, mr_path, body):
+    """PUT an optional change; returns the updated MR, or None when GitLab refused it or could not be reached."""
+    try:
+        resp = gitlab.request("PUT", mr_path, body=body, allow_statuses=_MR_UPDATE_REFUSED)
+    except MpsError:
+        return None
+    return resp.data if resp.status == 200 and isinstance(resp.data, dict) else None
+
+
+def _create_mr(gitlab, project_id, body, extras, label, warnings):
+    """POST the MR with the assignee / label extras; if GitLab rejects the request, retry without them (the MR
+    itself matters more) and report what was dropped."""
+    full = dict(body)
+    full.update(extras)
+    path = "/projects/%s/merge_requests" % project_id
+    resp = gitlab.request("POST", path, body=full, allow_statuses=(400, 409, 422))
+    if resp.status in (400, 422) and extras:
+        resp = gitlab.request("POST", path, body=body, allow_statuses=(400, 409, 422))
+        if resp.status in (200, 201):
+            details = extract_server_message(resp.data)
+            if "assignee_ids" in extras:
+                warnings.append(_assign_failed_warning(details))
+            if "labels" in extras:
+                warnings.append(_label_warning("label_failed", label, details))
+    return resp
+
+
+def _complete_existing_mr(gitlab, project_id, mr, me, label, warnings):
+    """Add what an existing MR lacks: the user as assignee only when it has NO assignee, and the missing label."""
+    mr_path = "/projects/%s/merge_requests/%s" % (project_id, mr.get("iid"))
+    if me and not mr_assignee_usernames(mr):
+        updated = _update_mr(gitlab, mr_path, {"assignee_ids": [me["id"]]})
+        if updated is None:
+            warnings.append(_assign_failed_warning("PUT %s refused" % mr_path))
+        else:
+            mr = updated
+    if label and match_label_name(mr.get("labels"), label) is None:
+        updated = _update_mr(gitlab, mr_path, {"add_labels": label})
+        if updated is None:
+            warnings.append(_label_warning("label_failed", label, "PUT %s refused" % mr_path))
+        else:
+            mr = updated
+    return mr
+
+
 def cmd_mr_ensure(args):
     root = find_project_root()
     cfg = load_config(root)
+    # Enforced here, whatever the agent was told: no AI attribution in the MR the team reviews.
+    title, title_stripped = strip_ai_attribution(args.title)
+    description, description_stripped = strip_ai_attribution(args.description)
+    if not title.strip() or not description.strip():
+        raise MpsError("empty_message", "Tiêu đề hoặc mô tả merge request đang trống.")
     if args.source == args.target:
         raise MpsError("invalid_mr", "Nhánh nguồn và nhánh đích không được trùng nhau.")
     branches = cfg.branches()
@@ -2966,25 +3550,41 @@ def cmd_mr_ensure(args):
     ensure_mr_target(root, args.source, args.target, normalize_issue_key(args.key), branches)
     gitlab = gitlab_client(cfg)
     project = resolve_gitlab_project(cfg, gitlab)
+    # Assignee and label are best effort: their failures are warnings and never stop the MR.
+    warnings = []
+    me = _current_gitlab_user(gitlab, warnings)
+    label = find_gitlab_label(gitlab, project["id"], MR_LABELS[args.type], warnings)
     existing = _find_open_mr(gitlab, project["id"], args.source)
+    mr = None
     if existing is None:
-        body = {"source_branch": args.source, "target_branch": args.target, "title": args.title,
-                "description": args.description, "remove_source_branch": True}
-        resp = gitlab.request("POST", "/projects/%s/merge_requests" % project["id"], body=body,
-                              allow_statuses=(400, 409, 422))
+        body = {"source_branch": args.source, "target_branch": args.target, "title": title,
+                "description": description, "remove_source_branch": True}
+        extras = {}
+        if me:
+            extras["assignee_ids"] = [me["id"]]
+        if label:
+            extras["labels"] = label
+        resp = _create_mr(gitlab, project["id"], body, extras, label, warnings)
         if resp.status in (200, 201):
-            return _mr_summary(resp.data, False)
-        existing = _find_open_mr(gitlab, project["id"], args.source) if resp.status == 409 else None
-        if existing is None:
-            raise MpsError("mr_create_failed", "GitLab không tạo được merge request (nhánh đã được đẩy lên chưa?).",
-                           details=extract_server_message(resp.data), status=resp.status)
-    if existing.get("target_branch") != args.target:
-        raise MpsError("mr_target_mismatch",
-                       "Nhánh %s đã có merge request đang mở nhưng nhắm vào %s thay vì %s. Không dùng tiếp MR này — hãy "
-                       "nhờ developer kiểm tra (có thể cần một nhánh khác cho giai đoạn này)."
-                       % (args.source, existing.get("target_branch"), args.target),
-                       existing_mr=_mr_summary(existing, True), expected_target=args.target)
-    return _mr_summary(existing, True)
+            mr = resp.data
+        else:
+            # GitLab answers 409 or 422 when an open MR for the branch appeared meanwhile: reuse that one.
+            existing = _find_open_mr(gitlab, project["id"], args.source) if resp.status in (409, 422) else None
+            if existing is None:
+                raise MpsError("mr_create_failed", "GitLab không tạo được merge request (nhánh đã được đẩy lên chưa?).",
+                               details=extract_server_message(resp.data), status=resp.status)
+    if mr is None:
+        if existing.get("target_branch") != args.target:
+            raise MpsError("mr_target_mismatch",
+                           "Nhánh %s đã có merge request đang mở nhưng nhắm vào %s thay vì %s. Không dùng tiếp MR "
+                           "này — hãy nhờ developer kiểm tra (có thể cần một nhánh khác cho giai đoạn này)."
+                           % (args.source, existing.get("target_branch"), args.target),
+                           existing_mr=_mr_summary(existing, True), expected_target=args.target)
+        mr = _complete_existing_mr(gitlab, project["id"], existing, me, label, warnings)
+    result = _mr_summary(mr, existing is not None)
+    result.update({"assignees": mr_assignee_usernames(mr), "labels": list(mr.get("labels") or []),
+                   "warnings": warnings, "attribution_removed": title_stripped or description_stripped})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3022,6 +3622,10 @@ def build_parser():
     p.add_argument("key")
     p.add_argument("value")
     p.set_defaults(handler=cmd_env_set)
+
+    project = _subcommands(groups.add_parser("project", help="plugin integration for the project (lead)"), "command")
+    p = project.add_parser("setup", help="add the plugin (auto-update on) to .claude/settings.json, git-ignore .env")
+    p.set_defaults(handler=cmd_project_setup)
 
     jira = _subcommands(groups.add_parser("jira", help="Jira tickets"), "command")
     p = jira.add_parser("get", help="read a ticket")

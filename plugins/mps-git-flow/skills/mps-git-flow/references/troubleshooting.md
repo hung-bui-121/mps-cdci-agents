@@ -8,8 +8,8 @@ Each script failure has an `error` code, a Vietnamese `message` and often `servi
 | error | Meaning | What to do |
 |---|---|---|
 | `not_git_repo` | Not inside a git project | Ask the user to open Claude Code in the project folder |
-| `env_missing` | No `.env` at the project root | `env init --open`, then let the user fill tokens |
-| `missing_config` | Keys in `missing_keys` are empty | User fills them in `.env` (tokens) or `env set` (non-secret) |
+| `env_missing` | No `.env` at the project root (`next`: `env init --open`) | `env init --open`, then relay its `fill_guide`: the user fills only `MPS_JIRA_PAT`, `MPS_JIRA_PROJECT_KEY`, `MPS_GITLAB_PAT` |
+| `missing_config` | Keys in `missing_keys` are empty | Relay `fill_guide` (steps per key); the user fills tokens in `.env` themselves, non-secret keys via `env set` |
 | `secret_key_refused` | `env set` on a `*_PAT` key | Tokens are only typed by the user into `.env` with an editor |
 | `unknown_key` | Typo in `env set` | Use one of `allowed_keys` |
 | `insecure_url` | URL is not https | Fix `MPS_JIRA_URL` / `MPS_GITLAB_URL` to `https://...` |
@@ -21,11 +21,37 @@ Each script failure has an `error` code, a Vietnamese `message` and often `servi
 token is never picked up for another). If `env_tracked` appears in `warnings`, `.env` was committed in the past:
 a developer must remove it from git (`git rm --cached .env`) and the tokens must be replaced.
 
+`env check` also reports these `warnings` (on success and on its errors, together with `plugin_version`):
+
+| warning | Meaning | What to do |
+|---|---|---|
+| `plugin_outdated` | A newer mps-git-flow exists on GitHub (`latest`, `running`) | Run the two `commands` (`claude plugin marketplace update mps-cdci-agents`, `claude plugin update mps-git-flow@mps-cdci-agents`); if they fail, the user types `/plugin marketplace update mps-cdci-agents`. The new version is active after `/reload-plugins` or a restart. `update_blockers` lists env vars that turned automatic updates off (`DISABLE_UPDATES`, `DISABLE_AUTOUPDATER`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; `FORCE_AUTOUPDATE_PLUGINS=1` turns plugin updates back on) |
+| `project_not_integrated` | The project's `.claude/settings.json` does not enable the plugin, so teammates do not get it automatically | Mention once that the lead can say "tích hợp plugin vào project" (skill mps-project-setup). Never change the file while pushing code |
+
+The version check reads `plugin.json` from GitHub (3 s in total, no token sent, `MPS_CA_BUNDLE` trusted in
+addition to the public CAs). When GitHub is unreachable it is silent (`plugin_version.checked: false`). It is
+skipped when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set, and when the project's `.claude/settings.json`
+pins the marketplace with `"ref"` (`plugin_version.pinned` names it; no `plugin_outdated` then).
+
+## Project integration (`project setup`, lead)
+
+| code | Kind | Meaning | What to do |
+|---|---|---|---|
+| `settings_invalid_json` | error (`line`, `column`) | `.claude/settings.json` is not valid JSON | Nothing was changed. A developer fixes the file, then run again |
+| `settings_not_object` | error | The file is JSON but not an object (`{...}`) | Nothing was changed. A developer checks the file |
+| `settings_conflict` | error (`key`) | `extraKnownMarketplaces`, its `mps-cdci-agents` entry (also an explicit `null`), `enabledPlugins` or `attribution` has an unexpected type | Nothing was changed. A developer checks that key |
+| `attribution_kept` | warning (`keys`) | The project already sets its own commit / PR attribution text (`attribution.commit`, `.pr` or `sessionUrl: true`); it is kept | Nothing to fix. The helper script strips AI attribution lines from commits and MRs anyway |
+| `marketplace_source_differs` | warning (`source`) | The `mps-cdci-agents` marketplace points to another source (a fork, a local folder); it is kept | Confirm with the lead that this is intended |
+| `settings_ignored_by_git` | warning | `.gitignore` ignores `.claude/settings.json`, so members never receive it | The lead removes that ignore line, then commits the file |
+
+Bootstrap (step 0) codes such as `python_missing`, `restart_required` or `store_stub_detected` are described in
+`references/setup-environment.md`.
+
 ## Tokens, network, certificates
 
 | error | Typical cause | What to do |
 |---|---|---|
-| `auth_failed` (401) | Token wrong, expired or revoked | Create a new token (Jira: Profile > Personal Access Tokens; GitLab: Edit profile > Access Tokens, scopes `api` + `write_repository`) and update `.env` |
+| `auth_failed` (401) | Token wrong, expired or revoked | Create a new token (Jira: Profile > Personal Access Tokens; GitLab: Edit profile > Access Tokens, scopes `api` + `write_repository`) and update `.env`. From `env check` the error carries `fill_guide` with the steps for that one token |
 | `forbidden` (403) | Token lacks a scope, or the account lacks permission | GitLab: recreate the token with `api` + `write_repository`; ask a maintainer for project access |
 | `network_unreachable` | VPN off, DNS failure, no network | Turn on the company VPN, check internet, retry |
 | `timeout` | Slow / blocked connection | Check VPN, retry |
@@ -53,6 +79,11 @@ a developer must remove it from git (`git rm --cached .env`) and the tokens must
 | `env_file` / `secret_detected` (commit, push) | `.env` or a token/private key would be committed or published | Nothing was committed / pushed. Remove the secret; for already-made commits a developer must help |
 | `add_failed` | A path given to `--files` does not exist or is ignored | Use root-relative paths from `git preflight` |
 | `mr_target_mismatch` | An open MR from this branch targets a different branch | Stop; a developer decides (close/retarget the old MR or use another branch) |
+| `assign_failed` (mr ensure warning) | The MR could not be assigned to the user (GitLab `/user` or the update was refused). The MR itself exists | The user assigns it to themselves on the MR page |
+| `label_not_found` (mr ensure warning) | The project / its groups have no `Enhancement` (story) or `Bug` (bug) label; the plugin never creates labels | Ask the lead to create the label, or pick a label by hand on the MR page |
+| `label_failed` (mr ensure warning) | The label exists but could not be read or added | Add the label by hand on the MR page |
+| `attribution_removed: true` (git commit, mr ensure) | AI attribution lines were dropped: a `Co-Authored-By` with an `@anthropic.com` address or naming only Claude (`Claude`, `Claude Code`, `Claude Opus 5.5`), `Generated with/by [Claude Code](...)`, `Claude-Session:` and a bare `https://claude.ai/code/session...` line. Human co-authors (also one named Claude, e.g. `Claude Martin <...@vng.com.vn>`) and other lines mentioning claude are kept | Nothing to fix; never add them back |
+| `empty_message` (git commit, mr ensure) | The commit message, MR title or MR description is empty (also when it held only AI attribution) | Use the texts from `naming build` |
 | `base_mismatch` (prepare-branch, push) | The ticket branch was made from `recorded_base` and must merge back into it | Use the recorded base. Moving the work to another branch/phase needs a developer |
 | `target_mismatch_recorded_base` (mr ensure) | MR target differs from the branch's recorded base | Use `--target=<recorded_base>`; otherwise ask a developer |
 | `phase_conflict` (flow plan) | The chosen phase differs from the branch that holds the work (changes / unpushed commits on it, or this ticket's own branch) | Explain: changes go back into the branch they were made on; moving them to another phase needs a developer |
@@ -84,7 +115,7 @@ a developer must remove it from git (`git rm --cached .env`) and the tokens must
 | `push_rejected` | The remote branch has commits you do not have | Never force. A developer (or a careful `git pull --no-rebase origin <branch>` with the user's consent) must bring them in first |
 | `push_denied` | Protected branch / no permission | Ask a maintainer about permissions |
 | `auth_failed` (git) | git credentials rejected | The script already retried once with `MPS_GITLAB_PAT` (https remotes on the MPS GitLab host only). Check the token has `write_repository`. For SSH remotes, the user's SSH key must be set up in GitLab |
-| `git_not_found` | git is not installed / not on PATH | Install Git (Windows: `winget install -e --id Git.Git`) after asking permission |
+| `git_not_found` | git is not installed / not on PATH | Run step 0 again (the bootstrap script installs git, or asks for a restart of Claude Code: `references/setup-environment.md`) |
 
 The token retry passes the PAT to git via environment variables (`GIT_CONFIG_COUNT` /
 `http.<MPS_GITLAB_URL>/.extraHeader`, so the header is only sent to the MPS GitLab host), never in the command
@@ -110,5 +141,5 @@ error messages can be recognised on Vietnamese-language systems.
 
 ## Python
 
-`python_too_old` means the script ran on Python 2 / < 3.8: use the Python 3 command from step 0
-(`references/setup-python.md`).
+`python_too_old` means the script ran on Python 2 / < 3.8: use the `python_cmd` from step 0
+(`references/setup-environment.md`).

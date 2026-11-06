@@ -5,11 +5,16 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -649,6 +654,70 @@ class FakeService(object):
 
     def get(self, path, params=None):
         return self.request("GET", path, params=params).data
+
+
+class FakeMrGitLab(object):
+    """A GitLab project (grp/proj, id 1) with labels and merge requests that POST / PUT really change.
+
+    reject_extras: the POST is refused (400) while it carries assignee_ids or labels.
+    race_status: another open MR for the branch appears just before the POST, which GitLab refuses with this status.
+    """
+
+    def __init__(self, labels=("Enhancement", "Bug"), mrs=(), reject_extras=False, race_status=None):
+        self.user = {"id": 7, "username": "hung"}
+        self.labels = [{"name": name} for name in labels]
+        self.mrs = [dict(mr) for mr in mrs]
+        self.reject_extras = reject_extras
+        self.race_status = race_status
+        self.calls = []
+
+    def respond(self, status, data):
+        return mps.HttpResponse(status, json.loads(json.dumps(data)), {})
+
+    def find_mr(self, path):
+        return [mr for mr in self.mrs if "/merge_requests/%s" % mr["iid"] == path[len("/projects/1"):]][0]
+
+    def request(self, method, path, params=None, body=None, allow_statuses=()):
+        self.calls.append((method, path, body))
+        if (method, path) == ("GET", "/projects/grp%2Fproj"):
+            return self.respond(200, {"id": 1, "path_with_namespace": "grp/proj", "web_url": "u"})
+        if (method, path) == ("GET", "/user"):
+            return self.respond(200, self.user)
+        if (method, path) == ("GET", "/projects/1/labels"):
+            assert params["include_ancestor_groups"] == "true"
+            wanted = params["search"].lower()
+            return self.respond(200, [label for label in self.labels if wanted in label["name"].lower()])
+        if (method, path) == ("GET", "/projects/1/merge_requests"):
+            return self.respond(200, [mr for mr in self.mrs if mr["source_branch"] == params["source_branch"]])
+        if (method, path) == ("POST", "/projects/1/merge_requests"):
+            if self.race_status:
+                self.mrs.append({"iid": 9, "web_url": "u", "title": "t", "source_branch": body["source_branch"],
+                                 "target_branch": body["target_branch"], "state": "opened", "labels": [],
+                                 "assignees": []})
+                return self.respond(self.race_status, {"message": ["Another open merge request already exists"]})
+            if self.reject_extras and ("labels" in body or "assignee_ids" in body):
+                return self.respond(400, {"message": "invalid assignee or label"})
+            mr = {"iid": len(self.mrs) + 1, "web_url": "https://git.example/mr", "title": body["title"],
+                  "description": body["description"], "source_branch": body["source_branch"],
+                  "target_branch": body["target_branch"], "state": "opened",
+                  "labels": [body["labels"]] if body.get("labels") else [],
+                  "assignees": [self.user] if body.get("assignee_ids") == [self.user["id"]] else []}
+            self.mrs.append(mr)
+            return self.respond(201, mr)
+        if method == "PUT" and path.startswith("/projects/1/merge_requests/"):
+            mr = self.find_mr(path)
+            if "assignee_ids" in body:
+                mr["assignees"] = [self.user]
+            if "add_labels" in body:
+                mr["labels"] = mr["labels"] + [body["add_labels"]]
+            return self.respond(200, mr)
+        raise AssertionError("unexpected call %s %s" % (method, path))
+
+    def get(self, path, params=None):
+        return self.request("GET", path, params=params).data
+
+    def bodies(self, method):
+        return [call[2] for call in self.calls if call[0] == method]
 
 
 def fake_gitlab(release_branches):
@@ -1364,6 +1433,838 @@ class GitFlowTests(unittest.TestCase):
         self.assertEqual(mps.unpushed_commit_count(self.repo), 1)
         refused = self.prepare("feature/MPS-36-b", "MPS-36")
         self.assertEqual((refused["error"], refused["count"]), ("local_commits_not_carried", 1))
+
+    # -- 0.1.1: project setup, version check, .env onboarding ----------------
+
+    def settings_bytes(self):
+        with open(os.path.join(self.repo, ".claude", "settings.json"), "rb") as handle:
+            return handle.read()
+
+    def env_check(self, latest=None):
+        """`env check` with the GitHub version lookup replaced (tests never reach the network)."""
+        with mock.patch.object(mps, "fetch_latest_plugin_version", return_value=latest):
+            return self.mps("env", "check")
+
+    def write_connected_env(self):
+        self.write_env(MPS_JIRA_URL="https://jira.example", MPS_JIRA_PAT="jira-token", MPS_JIRA_PROJECT_KEY="MPS",
+                       MPS_GITLAB_URL="https://git.example", MPS_GITLAB_PAT="gitlab-token",
+                       MPS_GITLAB_PROJECT="grp/proj")
+
+    def connected_env_check(self, latest=None):
+        """A successful `env check` (after write_connected_env) with Jira and GitLab faked."""
+        jira = FakeService({("GET", "/rest/api/2/myself"): (200, {"name": "hung"}),
+                            ("GET", "/rest/api/2/project/MPS"): (200, {"key": "MPS", "name": "Game"})})
+        gitlab = FakeService({("GET", "/user"): (200, {"id": 7, "username": "hung"}),
+                              ("GET", "/projects/grp%2Fproj"): (200, {"id": 1, "path_with_namespace": "grp/proj"}),
+                              ("GET", "/projects/1/members/all/7"): (200, {"access_level": 30})})
+        with mock.patch.object(mps, "jira_client", return_value=jira), \
+                mock.patch.object(mps, "gitlab_client", return_value=gitlab):
+            return self.env_check(latest)
+
+    def test_project_setup_creates_settings_and_is_idempotent(self):
+        """P1."""
+        first = self.mps("project", "setup")
+        expected = mps.render_settings_json(mps.merge_project_settings({})[0], "\n").encode("utf-8")
+        self.assertEqual(self.settings_bytes(), expected)
+        self.assertEqual((first["created"], first["changed"], first["changes"]),
+                         (True, True, NEW_SETTINGS_CHANGES))
+        self.assertTrue(first["gitignore_updated"])
+        self.assertIn(".env", self.read(".gitignore").splitlines())
+        self.assertEqual(first["files_to_commit"], [".claude/settings.json", ".gitignore"])
+        self.assertEqual((first["warnings"], first["next"]), ([], "commit_with_mps_git_flow"))
+        second = self.mps("project", "setup")
+        self.assertEqual((second["created"], second["changed"], second["changes"]), (False, False, []))
+        self.assertEqual(self.settings_bytes(), expected)
+
+    def test_project_setup_keeps_keys_and_crlf_and_refuses_invalid_json(self):
+        """P2."""
+        os.makedirs(os.path.join(self.repo, ".claude"))
+        path = os.path.join(self.repo, ".claude", "settings.json")
+        with open(path, "wb") as handle:
+            handle.write(b'{\r\n  "permissions": {"allow": ["Bash(ls)"]},\r\n  "env": {"A": "1"}\r\n}\r\n')
+        result = self.mps("project", "setup")
+        self.assertEqual(result["changes"], NEW_SETTINGS_CHANGES)
+        written = self.settings_bytes()
+        self.assertNotIn(b"\n", written.replace(b"\r\n", b""))
+        data = json.loads(written.decode("utf-8"))
+        self.assertEqual(list(data), ["permissions", "env", "extraKnownMarketplaces", "enabledPlugins", "attribution"])
+        self.assertEqual((data["permissions"], data["env"]), ({"allow": ["Bash(ls)"]}, {"A": "1"}))
+        broken = b'{"permissions": {'
+        with open(path, "wb") as handle:
+            handle.write(broken)
+        refused = self.mps("project", "setup")
+        self.assertEqual(refused["error"], "settings_invalid_json")
+        self.assertIsInstance(refused["line"], int)
+        self.assertEqual(self.settings_bytes(), broken)
+
+    def write_settings(self, data):
+        os.makedirs(os.path.join(self.repo, ".claude"), exist_ok=True)
+        with open(os.path.join(self.repo, ".claude", "settings.json"), "wb") as handle:
+            handle.write(data)
+
+    def test_project_setup_rerun_before_commit_still_lists_files(self):
+        """M4: changed false does not mean committed."""
+        self.mps("project", "setup")
+        again = self.mps("project", "setup")
+        self.assertFalse(again["changed"])
+        self.assertEqual(again["files_to_commit"], [".claude/settings.json", ".gitignore"])
+        self.assertEqual(again["next"], "commit_with_mps_git_flow")
+        self.git("add", ".claude/settings.json", ".gitignore")
+        self.git("commit", "-q", "-m", "chore: integrate plugin")
+        done = self.mps("project", "setup")
+        self.assertEqual((done["changed"], done["files_to_commit"], done["next"]), (False, [], None))
+
+    def test_project_setup_is_a_no_op_on_integrated_crlf_bom_file(self):
+        rendered = mps.render_settings_json(mps.merge_project_settings({"model": "x"})[0], "\r\n")
+        original = UTF8_BOM + rendered.encode("utf-8")
+        self.write_settings(original)
+        result = self.mps("project", "setup")
+        self.assertEqual((result["changed"], result["changes"]), (False, []))
+        self.assertEqual(self.settings_bytes(), original)
+
+    def test_project_setup_keeps_the_file_indent(self):
+        self.write_settings(b'{\n    "model": "x"\n}\n')
+        self.mps("project", "setup")
+        text = self.settings_bytes().decode("utf-8")
+        self.assertTrue(text.startswith('{\n    "model": "x",\n    "extraKnownMarketplaces": {\n        "'), text)
+        self.assertEqual([name for name in os.listdir(os.path.join(self.repo, ".claude"))], ["settings.json"])
+
+    def test_tracked_settings_are_not_reported_as_ignored(self):
+        """m2: git keeps committing a tracked file whatever .gitignore says."""
+        self.write_settings(b"{}\n")
+        self.git("add", ".claude/settings.json")
+        self.git("commit", "-q", "-m", "chore: settings")
+        self.write(".gitignore", ".claude/\n")
+        result = self.mps("project", "setup")
+        self.assertEqual(result["warnings"], [])
+        self.assertIn(".claude/settings.json", result["files_to_commit"])
+
+    def test_invalid_settings_count_as_not_integrated(self):
+        self.write_settings(b'{"enabledPlugins": ')
+        self.assertEqual(mps.project_settings_status(self.repo), "missing")
+        self.assertIsNone(mps.load_project_settings(self.repo))
+
+    def test_env_check_skips_version_check_when_pinned(self):
+        """M3: a ref-pinned marketplace is a deliberate version choice."""
+        settings = mps.merge_project_settings({})[0]
+        settings["extraKnownMarketplaces"]["mps-cdci-agents"]["source"]["ref"] = "v0.1.1"
+        self.write_settings(mps.render_settings_json(settings, "\n").encode("utf-8"))
+        self.write_connected_env()
+        with mock.patch.object(mps, "fetch_latest_plugin_version", return_value="99.0.0") as fetch:
+            result = self.connected_env_check(latest="99.0.0")
+            fetch.assert_not_called()
+        self.assertEqual(result["plugin_version"],
+                         {"running": mps.VERSION, "latest": None, "checked": False, "pinned": "v0.1.1"})
+        codes = [w["code"] for w in result["warnings"]]
+        self.assertNotIn("plugin_outdated", codes)
+        self.assertNotIn("project_not_integrated", codes)
+
+    def test_project_setup_warns_when_settings_are_ignored(self):
+        """P3."""
+        self.write(".gitignore", ".claude/\n")
+        result = self.mps("project", "setup")
+        self.assertEqual([w["code"] for w in result["warnings"]], ["settings_ignored_by_git"])
+
+    def test_env_check_reports_newer_plugin_version(self):
+        """P4: plugin_outdated on success and on errors; an unreachable GitHub is silent."""
+        self.write_connected_env()
+        outdated = self.connected_env_check(latest="99.0.0")
+        self.assertEqual(outdated["plugin_version"], {"running": mps.VERSION, "latest": "99.0.0", "checked": True})
+        warning = [w for w in outdated["warnings"] if w["code"] == "plugin_outdated"][0]
+        self.assertEqual((warning["latest"], warning["running"]), ("99.0.0", mps.VERSION))
+        self.assertEqual(warning["commands"], ["claude plugin marketplace update mps-cdci-agents",
+                                               "claude plugin update mps-git-flow@mps-cdci-agents"])
+        self.assertEqual(outdated["gitlab_access_level"], 30)
+        offline = self.connected_env_check(latest=None)
+        self.assertEqual(offline["plugin_version"], {"running": mps.VERSION, "latest": None, "checked": False})
+        self.assertNotIn("plugin_outdated", [w["code"] for w in offline["warnings"]])
+        os.remove(os.path.join(self.repo, ".env"))
+        missing = self.env_check(latest="99.0.0")
+        self.assertEqual((missing["error"], missing["next"]), ("env_missing", "env init --open"))
+        self.assertEqual(missing["plugin_version"]["latest"], "99.0.0")
+        self.assertIn("plugin_outdated", [w["code"] for w in missing["warnings"]])
+
+    def test_env_check_reports_project_not_integrated(self):
+        """P5."""
+        self.write_connected_env()
+        before = self.connected_env_check()
+        self.assertIn("project_not_integrated", [w["code"] for w in before["warnings"]])
+        self.mps("project", "setup")
+        after = self.connected_env_check()
+        self.assertNotIn("project_not_integrated", [w["code"] for w in after["warnings"]])
+
+    def test_env_init_gives_fill_guide_for_blank_member_keys(self):
+        """R.11.4: a new .env needs the three member keys; a filled one needs nothing."""
+        created = self.mps("env", "init")
+        self.assertTrue(created["created"])
+        self.assertEqual(created["keys_to_fill"], list(mps.MEMBER_KEYS))
+        self.assertEqual([entry["key"] for entry in created["fill_guide"]], list(mps.MEMBER_KEYS))
+        with open(os.path.join(self.repo, ".env"), "rb") as handle:
+            text = handle.read().decode("utf-8")
+        for key, value in (("MPS_JIRA_PAT", "jira-token"), ("MPS_JIRA_PROJECT_KEY", "MPS"),
+                           ("MPS_GITLAB_PAT", "gitlab-token")):
+            text = mps.update_env_text(text, key, value)
+        with open(os.path.join(self.repo, ".env"), "wb") as handle:
+            handle.write(text.encode("utf-8"))
+        again = self.mps("env", "init")
+        self.assertEqual((again["created"], again["fill_guide"], again["keys_to_fill"]), (False, [], []))
+
+    def test_env_check_missing_tokens_gives_fill_guide(self):
+        """R.11.4: blank PATs -> missing_config with a guide for exactly those keys."""
+        self.write_env(MPS_JIRA_PAT="", MPS_JIRA_PROJECT_KEY="MPS", MPS_GITLAB_PAT="")
+        result = self.env_check()
+        self.assertEqual(result["error"], "missing_config")
+        self.assertEqual(result["missing_keys"], ["MPS_JIRA_PAT", "MPS_GITLAB_PAT"])
+        self.assertEqual([entry["key"] for entry in result["fill_guide"]], ["MPS_JIRA_PAT", "MPS_GITLAB_PAT"])
+        self.assertIn("plugin_version", result)
+
+    def test_env_check_rejected_token_gives_fill_guide(self):
+        """R.11.2: a 401 from GitLab during env check carries the guide for that one token."""
+        self.write_env(MPS_JIRA_URL="https://jira.example", MPS_JIRA_PAT="jira-token", MPS_JIRA_PROJECT_KEY="MPS",
+                       MPS_GITLAB_URL="https://git.example", MPS_GITLAB_PAT="gitlab-token")
+        jira = FakeService({("GET", "/rest/api/2/myself"): (200, {"name": "hung"})})
+        gitlab = mock.Mock()
+        gitlab.get.side_effect = mps.MpsError("auth_failed", "401", service="gitlab", status=401)
+        with mock.patch.object(mps, "jira_client", return_value=jira), \
+                mock.patch.object(mps, "gitlab_client", return_value=gitlab):
+            result = self.env_check()
+        self.assertEqual(result["error"], "auth_failed")
+        self.assertEqual([entry["key"] for entry in result["fill_guide"]], ["MPS_GITLAB_PAT"])
+        self.assertIn("hết hạn", result["fill_guide"][0]["steps"][0])
+
+    # -- 0.1.1: MR assignee, labels, no AI attribution ------------------------
+
+    def pushed_ticket_branch(self, key):
+        """A pushed ticket branch with one commit for `key`, ready for `mr ensure`."""
+        if not os.path.isfile(os.path.join(self.repo, ".env")):
+            self.write_env(MPS_GITLAB_URL="https://git.example", MPS_GITLAB_PAT="gitlab-token",
+                           MPS_GITLAB_PROJECT="grp/proj")
+        branch = "feature/%s-a" % key
+        self.prepare(branch, key)
+        self.write("a.txt", "a %s\n" % key)
+        self.approve(["a.txt"])
+        self.commit("feat: %s a" % key, "a.txt")
+        self.mps("git", "push", "--branch=" + branch, "--base=develop")
+        return branch
+
+    def ensure_mr(self, gitlab, branch, key, kind="story", description=None):
+        with mock.patch.object(mps, "gitlab_client", return_value=gitlab):
+            return self.mps("mr", "ensure", "--source=" + branch, "--target=develop", "--title=%s a" % key,
+                            "--description=" + (description or "Close " + key), "--key=" + key, "--type=" + kind)
+
+    def test_mr_created_with_assignee_and_label(self):
+        branch = self.pushed_ticket_branch("MPS-40")
+        gitlab = FakeMrGitLab()
+        result = self.ensure_mr(gitlab, branch, "MPS-40", "story")
+        self.assertEqual((result["existed"], result["assignees"], result["labels"], result["warnings"]),
+                         (False, ["hung"], ["Enhancement"], []))
+        body = gitlab.bodies("POST")[0]
+        self.assertEqual((body["assignee_ids"], body["labels"]), ([7], "Enhancement"))
+        self.assertFalse(result["attribution_removed"])
+
+    def test_existing_mr_gets_missing_assignee_and_label(self):
+        branch = self.pushed_ticket_branch("MPS-41")
+        mr = {"iid": 5, "web_url": "u", "title": "t", "source_branch": branch, "target_branch": "develop",
+              "state": "opened", "labels": [], "assignees": []}
+        gitlab = FakeMrGitLab(mrs=[mr])
+        result = self.ensure_mr(gitlab, branch, "MPS-41", "bug")
+        self.assertEqual((result["existed"], result["assignees"], result["labels"]), (True, ["hung"], ["Bug"]))
+        self.assertEqual(gitlab.bodies("PUT"), [{"assignee_ids": [7]}, {"add_labels": "Bug"}])
+        self.assertEqual(gitlab.bodies("POST"), [])
+
+    def test_existing_assignee_is_left_alone(self):
+        branch = self.pushed_ticket_branch("MPS-42")
+        mr = {"iid": 6, "web_url": "u", "title": "t", "source_branch": branch, "target_branch": "develop",
+              "state": "opened", "labels": ["Bug"], "assignees": [{"id": 9, "username": "lead"}]}
+        gitlab = FakeMrGitLab(mrs=[mr])
+        result = self.ensure_mr(gitlab, branch, "MPS-42", "bug")
+        self.assertEqual((result["assignees"], result["labels"], result["warnings"]), (["lead"], ["Bug"], []))
+        self.assertEqual(gitlab.bodies("PUT"), [])
+
+    def test_missing_label_warns_and_still_creates_the_mr(self):
+        branch = self.pushed_ticket_branch("MPS-43")
+        gitlab = FakeMrGitLab(labels=("Bug report",))
+        result = self.ensure_mr(gitlab, branch, "MPS-43", "bug")
+        self.assertEqual((result["existed"], result["labels"], result["assignees"]), (False, [], ["hung"]))
+        self.assertEqual([(w["code"], w["label"]) for w in result["warnings"]], [("label_not_found", "Bug")])
+        self.assertNotIn("labels", gitlab.bodies("POST")[0])
+
+    def test_label_with_other_case_uses_the_existing_name(self):
+        branch = self.pushed_ticket_branch("MPS-44")
+        gitlab = FakeMrGitLab(labels=("bug", "enhancement"))
+        result = self.ensure_mr(gitlab, branch, "MPS-44", "bug")
+        self.assertEqual(result["labels"], ["bug"])
+        self.assertEqual(gitlab.bodies("POST")[0]["labels"], "bug")
+
+    def test_rejected_extras_still_create_the_mr(self):
+        branch = self.pushed_ticket_branch("MPS-46")
+        gitlab = FakeMrGitLab(reject_extras=True)
+        result = self.ensure_mr(gitlab, branch, "MPS-46", "story")
+        self.assertEqual((result["existed"], result["iid"]), (False, 1))
+        self.assertEqual(sorted(w["code"] for w in result["warnings"]), ["assign_failed", "label_failed"])
+        self.assertEqual(len(gitlab.bodies("POST")), 2)
+
+    def test_mr_appearing_during_create_is_reused(self):
+        """n2: GitLab may answer 409 or 422 when an open MR for the branch already exists."""
+        branch = self.pushed_ticket_branch("MPS-47")
+        for status in (409, 422):
+            gitlab = FakeMrGitLab(race_status=status)
+            result = self.ensure_mr(gitlab, branch, "MPS-47", "bug")
+            self.assertEqual((result["existed"], result["iid"], result["assignees"], result["labels"]),
+                             (True, 9, ["hung"], ["Bug"]), status)
+
+    def test_ai_attribution_stripped_from_commit_and_mr(self):
+        branch = "feature/MPS-45-a"
+        self.write_env(MPS_GITLAB_URL="https://git.example", MPS_GITLAB_PAT="gitlab-token",
+                       MPS_GITLAB_PROJECT="grp/proj")
+        self.prepare(branch, "MPS-45")
+        self.write("a.txt", "a\n")
+        self.approve(["a.txt"])
+        only_ai = self.commit("Co-Authored-By: Claude <noreply@anthropic.com>", "a.txt")
+        self.assertEqual(only_ai["error"], "empty_message")
+        human = "Co-Authored-By: Lan Nguyen <lan@example.com>"
+        message = "feat: MPS-45 a\n\n%s\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n" % human
+        done = self.commit(message, "a.txt")
+        self.assertTrue(done["attribution_removed"])
+        self.assertEqual(self.git("log", "-1", "--format=%B").strip(), "feat: MPS-45 a\n\n" + human)
+        self.mps("git", "push", "--branch=" + branch, "--base=develop")
+        gitlab = FakeMrGitLab()
+        description = ("Close MPS-45\n%s\n\n\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
+                       % human)
+        result = self.ensure_mr(gitlab, branch, "MPS-45", "story", description)
+        self.assertTrue(result["attribution_removed"])
+        self.assertEqual(gitlab.bodies("POST")[0]["description"], "Close MPS-45\n" + human)
+
+
+# ---------------------------------------------------------------------------
+# 0.1.1: project integration, version check, release discipline, bootstrap
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+PLUGIN_DIR = os.path.join(REPO_ROOT, "plugins", "mps-git-flow")
+SCRIPTS_DIR = os.path.join(PLUGIN_DIR, "skills", "mps-git-flow", "scripts")
+BOOTSTRAP_PS1 = os.path.join(SCRIPTS_DIR, "bootstrap.ps1")
+BOOTSTRAP_SH = os.path.join(SCRIPTS_DIR, "bootstrap.sh")
+UTF8_BOM = b"\xef\xbb\xbf"
+NEW_SETTINGS_CHANGES = ["marketplace_added", "plugin_enabled", "attribution_disabled"]
+EXPECTED_MARKETPLACE = {"source": {"source": "github", "repo": "hung-bui-121/mps-cdci-agents"}, "autoUpdate": True}
+BOOTSTRAP_KEYS = ("ok", "os", "python_cmd", "missing", "manual_steps")
+BOOTSTRAP_TIMEOUT_SECONDS = 120
+# A fake installer outlives the tiny test budget by far; the pipe must close long before it ends.
+SLOW_INSTALLER_SECONDS = 25
+PIPE_CLOSE_MAX_SECONDS = 15
+# The stalled lookup is given 0.2 s; anything near the real 3 s would mean the thread limit does not work.
+STALLED_LOOKUP_MAX_SECONDS = 2
+
+
+def _read_bytes(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+class MergeProjectSettingsTests(unittest.TestCase):
+    """U1."""
+
+    def test_empty_settings_get_both_entries(self):
+        merged, changes, warnings = mps.merge_project_settings({})
+        self.assertEqual(merged, {"extraKnownMarketplaces": {"mps-cdci-agents": EXPECTED_MARKETPLACE},
+                                  "enabledPlugins": {"mps-git-flow@mps-cdci-agents": True},
+                                  "attribution": {"commit": "", "pr": "", "sessionUrl": False}})
+        self.assertEqual((changes, warnings), (NEW_SETTINGS_CHANGES, []))
+
+    def test_unrelated_keys_and_order_kept_input_not_mutated(self):
+        settings = {"permissions": {"allow": ["Bash(ls)"]}, "env": {"A": "1"}, "hooks": {"Stop": []}}
+        original = json.loads(json.dumps(settings))
+        merged, _, _ = mps.merge_project_settings(settings)
+        self.assertEqual(list(merged), ["permissions", "env", "hooks", "extraKnownMarketplaces", "enabledPlugins",
+                                        "attribution"])
+        self.assertEqual(merged["hooks"], {"Stop": []})
+        self.assertEqual(settings, original)
+
+    def test_existing_entry_auto_update_turned_on(self):
+        settings = {"extraKnownMarketplaces": {"mps-cdci-agents": {
+            "source": {"source": "github", "repo": "hung-bui-121/mps-cdci-agents"}, "autoUpdate": False}},
+            "enabledPlugins": {"mps-git-flow@mps-cdci-agents": False}}
+        merged, changes, warnings = mps.merge_project_settings(settings)
+        self.assertEqual(changes, ["auto_update_enabled", "plugin_enabled", "attribution_disabled"])
+        self.assertEqual(warnings, [])
+        self.assertIs(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["autoUpdate"], True)
+        self.assertIs(merged["enabledPlugins"]["mps-git-flow@mps-cdci-agents"], True)
+
+    def test_pinned_ref_is_not_a_different_source(self):
+        entry = {"source": {"source": "github", "repo": "hung-bui-121/mps-cdci-agents", "ref": "v0.1.1"},
+                 "autoUpdate": True}
+        merged, changes, warnings = mps.merge_project_settings({"extraKnownMarketplaces": {"mps-cdci-agents": entry}})
+        self.assertEqual((changes, warnings), (["plugin_enabled", "attribution_disabled"], []))
+        self.assertEqual(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["source"]["ref"], "v0.1.1")
+
+    def test_different_source_is_kept_and_reported(self):
+        local = {"source": "directory", "path": "D:/work/mps-cdci-agents"}
+        settings = {"extraKnownMarketplaces": {"mps-cdci-agents": {"source": local, "autoUpdate": True}}}
+        merged, _, warnings = mps.merge_project_settings(settings)
+        self.assertEqual(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["source"], local)
+        self.assertEqual([(w["code"], w["source"]) for w in warnings], [("marketplace_source_differs", local)])
+        self.assertIn("D:/work/mps-cdci-agents", warnings[0]["message"])
+
+    def test_second_merge_is_a_no_op(self):
+        merged, _, _ = mps.merge_project_settings({"model": "x"})
+        again, changes, warnings = mps.merge_project_settings(merged)
+        self.assertEqual((again, changes, warnings), (merged, [], []))
+
+    def test_unexpected_types_conflict(self):
+        for settings, key in (({"extraKnownMarketplaces": []}, "extraKnownMarketplaces"),
+                              ({"extraKnownMarketplaces": {"mps-cdci-agents": "x"}},
+                               "extraKnownMarketplaces.mps-cdci-agents"),
+                              ({"extraKnownMarketplaces": {"mps-cdci-agents": None}},
+                               "extraKnownMarketplaces.mps-cdci-agents"),
+                              ({"enabledPlugins": ["mps-git-flow@mps-cdci-agents"]}, "enabledPlugins")):
+            with self.assertRaises(mps.MpsError) as ctx:
+                mps.merge_project_settings(settings)
+            self.assertEqual((ctx.exception.code, ctx.exception.extra["key"]), ("settings_conflict", key))
+
+
+class AttributionSettingTests(unittest.TestCase):
+    """`project setup` hides Claude Code's commit / PR attribution without overwriting the project's own choice."""
+
+    def test_partial_attribution_gets_only_the_missing_parts(self):
+        merged, changes, warnings = mps.merge_project_settings({"attribution": {"pr": ""}})
+        self.assertEqual(merged["attribution"], {"pr": "", "commit": "", "sessionUrl": False})
+        self.assertIn("attribution_disabled", changes)
+        self.assertEqual(warnings, [])
+
+    def test_custom_attribution_is_kept_and_reported(self):
+        custom = {"commit": "Made by the team", "pr": "", "sessionUrl": True}
+        merged, changes, warnings = mps.merge_project_settings({"attribution": dict(custom)})
+        self.assertEqual(merged["attribution"], custom)
+        self.assertNotIn("attribution_disabled", changes)
+        self.assertEqual([(w["code"], w["keys"]) for w in warnings], [("attribution_kept", ["commit", "sessionUrl"])])
+
+    def test_false_already_hides_everything(self):
+        merged, changes, _ = mps.merge_project_settings({"attribution": False})
+        self.assertIs(merged["attribution"], False)
+        self.assertNotIn("attribution_disabled", changes)
+
+    def test_unexpected_type_conflicts(self):
+        with self.assertRaises(mps.MpsError) as ctx:
+            mps.merge_project_settings({"attribution": "none"})
+        self.assertEqual((ctx.exception.code, ctx.exception.extra["key"]), ("settings_conflict", "attribution"))
+
+
+class StripAiAttributionTests(unittest.TestCase):
+    def test_claude_lines_removed_human_lines_kept(self):
+        text = "\n".join([
+            "feat: MPS-1 Thêm màn hình",
+            "",
+            "Close MPS-1",
+            "Co-Authored-By: Lan Nguyen <lan@example.com>",
+            "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+            "  co-authored-by: Someone <bot@anthropic.com>  ",
+            "Claude-Session: https://claude.ai/code/session_1",
+            "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)",
+            "Generated with Claude Code",
+            "",
+            "",
+        ])
+        cleaned, removed = mps.strip_ai_attribution(text)
+        self.assertTrue(removed)
+        self.assertEqual(cleaned, "feat: MPS-1 Thêm màn hình\n\nClose MPS-1\n"
+                                  "Co-Authored-By: Lan Nguyen <lan@example.com>")
+
+    def test_text_without_attribution_is_untouched(self):
+        for text in ("Close MPS-2\n\n", "fix: MPS-3 Claude là tên nhân vật trong game", "Generated with care", ""):
+            self.assertEqual(mps.strip_ai_attribution(text), (text, False))
+
+    def test_human_lines_mentioning_claude_are_kept(self):
+        for line in ("Co-Authored-By: Claude Martin <claude.martin@vng.com.vn>", "claude-api: bump SDK",
+                     "Generated with the OpenAPI generator for the claude endpoint", "Close MPS-12",
+                     "Claude-Version: 3 (header documented in the API)", "See https://claude.ai/code for details"):
+            self.assertEqual(mps.strip_ai_attribution(line), (line, False), line)
+
+    def test_ai_forms_are_stripped(self):
+        for line in ("Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+                     "Co-Authored-By: Claude <noreply@anthropic.com>",
+                     "Co-Authored-By: Claude Code",
+                     "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)",
+                     "Generated by Claude Code",
+                     "https://claude.ai/code/session_01AbCdEf",
+                     "Claude-Session: abc"):
+            self.assertEqual(mps.strip_ai_attribution("Close MPS-12\n" + line), ("Close MPS-12", True), line)
+
+    def test_only_attribution_leaves_nothing(self):
+        self.assertEqual(mps.strip_ai_attribution("Co-Authored-By: Claude <noreply@anthropic.com>\n"), ("", True))
+
+
+class LabelMatchTests(unittest.TestCase):
+    def test_match_ignores_case_and_returns_the_exact_name(self):
+        self.assertEqual(mps.match_label_name([{"name": "Bug report"}, {"name": "bug"}], "Bug"), "bug")
+        self.assertEqual(mps.match_label_name(["ENHANCEMENT"], "Enhancement"), "ENHANCEMENT")
+        self.assertIsNone(mps.match_label_name([{"name": "Bugfix"}], "Bug"))
+        self.assertIsNone(mps.match_label_name(None, "Bug"))
+
+    def test_assignee_usernames(self):
+        self.assertEqual(mps.mr_assignee_usernames({"assignees": [{"username": "a"}, {"username": "b"}]}), ["a", "b"])
+        self.assertEqual(mps.mr_assignee_usernames({"assignees": [], "assignee": {"username": "c"}}), ["c"])
+        self.assertEqual(mps.mr_assignee_usernames({}), [])
+
+
+class SettingsTextTests(unittest.TestCase):
+    """U2."""
+
+    def test_bom_and_empty_text(self):
+        self.assertEqual(mps.parse_settings_text(chr(0xFEFF) + '{"a": 1}'), {"a": 1})
+        self.assertEqual(mps.parse_settings_text(" \r\n"), {})
+
+    def test_not_object_and_invalid_json(self):
+        with self.assertRaises(mps.MpsError) as ctx:
+            mps.parse_settings_text("[1]")
+        self.assertEqual(ctx.exception.code, "settings_not_object")
+        with self.assertRaises(mps.MpsError) as ctx:
+            mps.parse_settings_text('{\n  "a":')
+        self.assertEqual(ctx.exception.code, "settings_invalid_json")
+        self.assertEqual((ctx.exception.extra["line"], ctx.exception.extra["column"]), (2, 7))
+
+    def test_render_keeps_vietnamese_and_newline_style(self):
+        settings = {"note": "Tiếng Việt", "nested": {"a": [1, 2]}}
+        text = mps.render_settings_json(settings, "\r\n")
+        self.assertIn('"Tiếng Việt"', text)
+        self.assertTrue(text.endswith("}\r\n"))
+        self.assertNotIn("\n", text.replace("\r\n", ""))
+        self.assertEqual(mps.parse_settings_text(text), settings)
+        self.assertTrue(mps.render_settings_json({}, "\n").endswith("\n"))
+
+
+class PluginVersionTests(unittest.TestCase):
+    """U3, U4."""
+
+    def test_parse_and_compare(self):
+        self.assertEqual(mps.parse_plugin_version("0.1.10"), (0, 1, 10))
+        self.assertEqual(mps.parse_plugin_version("v0.2.0"), (0, 2, 0))
+        self.assertTrue(mps.is_newer_version("0.1.10", "0.1.9"))
+        self.assertTrue(mps.is_newer_version("0.2.0", "0.1.99"))
+        self.assertTrue(mps.is_newer_version("v0.2.0", "0.1.1"))
+        self.assertFalse(mps.is_newer_version("0.1.1", "0.1.1"))
+        self.assertFalse(mps.is_newer_version("0.1.0", "0.1.1"))
+        for bad in ("", "1.x", "1.2", None, 3):
+            self.assertIsNone(mps.parse_plugin_version(bad))
+            self.assertFalse(mps.is_newer_version(bad, "0.1.0"))
+            self.assertFalse(mps.is_newer_version("9.9.9", bad))
+
+    def test_update_blockers(self):
+        self.assertEqual(mps.update_blockers({}), [])
+        self.assertEqual(mps.update_blockers({"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "",
+                                              "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}),
+                         ["DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"])
+        self.assertEqual(mps.update_blockers({"DISABLE_UPDATES": "1", "FORCE_AUTOUPDATE_PLUGINS": "1"}), [])
+
+
+class FakeHttpResponse(object):
+    def __init__(self, status, body):
+        self.status = status
+        self.body = body
+
+    def read(self, size=-1):
+        self.size = size
+        return self.body if size < 0 else self.body[:size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class FetchLatestVersionTests(unittest.TestCase):
+    """U4: the GitHub lookup never raises and never sends a token."""
+
+    def setUp(self):
+        self.cfg = mps.Config(tempfile.gettempdir(), {"MPS_GITLAB_PAT": "gitlab-token"}, True)
+
+    def fetch(self, outcome, environ=None):
+        opener = mock.Mock()
+        if isinstance(outcome, BaseException):
+            opener.open.side_effect = outcome
+        else:
+            opener.open.return_value = outcome
+        with mock.patch.object(mps.urllib.request, "build_opener", return_value=opener) as build:
+            version = mps.fetch_latest_plugin_version(self.cfg, environ if environ is not None else {})
+        return version, build, opener
+
+    def test_version_from_manifest(self):
+        version, _, opener = self.fetch(FakeHttpResponse(200, b'{"name": "mps-git-flow", "version": "0.2.0"}'))
+        self.assertEqual(version, "0.2.0")
+        request = opener.open.call_args[0][0]
+        self.assertEqual(request.full_url, mps.PLUGIN_MANIFEST_URL)
+        self.assertEqual(set(k.lower() for k in request.headers), {"user-agent"})
+        self.assertEqual(opener.open.call_args[1]["timeout"], mps.VERSION_CHECK_TIMEOUT_SECONDS)
+
+    def test_failures_give_none(self):
+        not_found = mps.urllib.error.HTTPError(mps.PLUGIN_MANIFEST_URL, 404, "Not Found", {}, io.BytesIO(b""))
+        for outcome in (socket.timeout("timed out"), not_found, FakeHttpResponse(200, b"<html>"),
+                        FakeHttpResponse(200, b'{"name": "x"}'), FakeHttpResponse(200, b'{"version": "1.x"}'),
+                        FakeHttpResponse(204, b"")):
+            self.assertIsNone(self.fetch(outcome)[0], outcome)
+
+    def test_nonessential_traffic_off_makes_no_request(self):
+        version, build, _ = self.fetch(FakeHttpResponse(200, b'{"version": "9.9.9"}'),
+                                       environ={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"})
+        self.assertIsNone(version)
+        build.assert_not_called()
+
+    def test_disable_autoupdater_still_checks(self):
+        version, _, _ = self.fetch(FakeHttpResponse(200, b'{"version": "9.9.9"}'), environ={"DISABLE_AUTOUPDATER": "1"})
+        self.assertEqual(version, "9.9.9")
+
+    def test_body_read_is_bounded(self):
+        response = FakeHttpResponse(200, b'{"version": "0.3.0"}')
+        self.assertEqual(self.fetch(response)[0], "0.3.0")
+        self.assertEqual(response.size, mps.MANIFEST_MAX_BYTES)
+
+    def test_stalled_lookup_returns_within_the_limit(self):
+        """A lookup that hangs (e.g. DNS) is abandoned after the timeout; env check is not delayed further."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        opener = mock.Mock()
+        opener.open.side_effect = lambda *args, **kwargs: release.wait(30)
+        with mock.patch.object(mps.urllib.request, "build_opener", return_value=opener), \
+                mock.patch.object(mps, "VERSION_CHECK_TIMEOUT_SECONDS", 0.2):
+            started = time.monotonic()
+            version = mps.fetch_latest_plugin_version(self.cfg, {})
+            elapsed = time.monotonic() - started
+        self.assertIsNone(version)
+        self.assertLess(elapsed, STALLED_LOOKUP_MAX_SECONDS)
+
+
+class IntegrationStatusTests(unittest.TestCase):
+    """U5."""
+
+    def test_pinned_marketplace_ref(self):
+        def settings(source):
+            return {"extraKnownMarketplaces": {"mps-cdci-agents": {"source": source}}}
+        self.assertEqual(mps.pinned_marketplace_ref(settings({"source": "github", "repo": "r", "ref": "v0.1.1"})),
+                         "v0.1.1")
+        for value in (settings({"source": "github", "repo": "r"}), settings({"ref": " "}), settings("x"), None, {},
+                      {"extraKnownMarketplaces": {"mps-cdci-agents": None}}):
+            self.assertIsNone(mps.pinned_marketplace_ref(value))
+
+    def test_detect_json_indent(self):
+        self.assertEqual(mps.detect_json_indent('{\n    "a": 1\n}\n'), 4)
+        self.assertEqual(mps.detect_json_indent('{\r\n\t"a": 1\r\n}\r\n'), "\t")
+        self.assertEqual(mps.detect_json_indent('{"a": 1}'), mps.DEFAULT_SETTINGS_INDENT)
+        self.assertEqual(mps.detect_json_indent(""), mps.DEFAULT_SETTINGS_INDENT)
+        self.assertIn('\n\t"a"', mps.render_settings_json({"a": 1}, "\n", "\t"))
+
+    def test_status(self):
+        self.assertEqual(mps.project_integration_status({}), "missing")
+        self.assertEqual(mps.project_integration_status({"enabledPlugins": {mps.PLUGIN_KEY: False}}), "missing")
+        self.assertEqual(mps.project_integration_status({"enabledPlugins": {mps.PLUGIN_KEY: True}}), "integrated")
+        self.assertEqual(mps.project_integration_status({"enabledPlugins": [mps.PLUGIN_KEY]}), "missing")
+
+
+class ReleaseDisciplineTests(unittest.TestCase):
+    """U6: every release bumps mps.VERSION and plugin.json together and documents itself."""
+
+    def test_plugin_json_version_matches_script(self):
+        manifest = json.loads(_read_bytes(os.path.join(PLUGIN_DIR, ".claude-plugin", "plugin.json")).decode("utf-8"))
+        self.assertEqual(manifest["version"], mps.VERSION)
+
+    def test_changelog_has_entry(self):
+        changelog = _read_bytes(os.path.join(REPO_ROOT, "CHANGELOG.md")).decode("utf-8")
+        self.assertRegex(changelog, r"(?m)^## " + re.escape(mps.VERSION) + r"(\s|$)")
+
+    def test_marketplace_has_no_plugin_version(self):
+        marketplace = json.loads(_read_bytes(os.path.join(REPO_ROOT, ".claude-plugin", "marketplace.json"))
+                                 .decode("utf-8"))
+        entry = [p for p in marketplace["plugins"] if p["name"] == "mps-git-flow"][0]
+        self.assertNotIn("version", entry)
+
+    def test_readme_settings_block_matches_project_setup(self):
+        readme = _read_bytes(os.path.join(REPO_ROOT, "README.md")).decode("utf-8")
+        blocks = [b for b in re.findall(r"```json\n(.*?)```", readme, re.DOTALL) if "extraKnownMarketplaces" in b]
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(json.loads(textwrap.dedent(blocks[0])), mps.merge_project_settings({})[0])
+
+
+class BootstrapFileHygieneTests(unittest.TestCase):
+    """U7: encodings and PowerShell 5.1 / POSIX guards that a casual edit could break."""
+
+    def test_ps1_has_bom_and_no_ps6_tokens(self):
+        data = _read_bytes(BOOTSTRAP_PS1)
+        self.assertTrue(data.startswith(UTF8_BOM))
+        text = data.decode("utf-8")
+        for token in ("??", "&&", "$IsWindows"):
+            self.assertNotIn(token, text)
+
+    def test_sh_is_lf_without_bom(self):
+        data = _read_bytes(BOOTSTRAP_SH)
+        self.assertNotIn(b"\r", data)
+        self.assertFalse(data.startswith(UTF8_BOM))
+
+    def test_no_prompts(self):
+        for path in (BOOTSTRAP_PS1, BOOTSTRAP_SH):
+            text = _read_bytes(path).decode("utf-8-sig")
+            self.assertNotIn("Read-Host", text)
+            self.assertIsNone(re.search(r"(^|[\s;&|(])read\s", text, re.MULTILINE), path)
+
+
+class EnvTemplateTests(unittest.TestCase):
+    """R.11.4: the member keys come first and blank; everything else keeps the defaults."""
+
+    def setUp(self):
+        self.text = _read_bytes(mps.ENV_TEMPLATE_PATH).decode("utf-8")
+        self.values = mps.parse_env(self.text)
+
+    def test_member_keys_first_and_blank(self):
+        keys = [m.group(1) for m in (mps._ENV_LINE_RE.match(line.strip()) for line in self.text.splitlines()
+                                     if line.strip() and not line.strip().startswith("#")) if m]
+        self.assertEqual(keys[:3], list(mps.MEMBER_KEYS))
+        for key in mps.MEMBER_KEYS:
+            self.assertEqual(self.values[key], "")
+
+    def test_every_other_key_present_with_default(self):
+        for key in mps.KNOWN_KEYS:
+            self.assertIn(key, self.values)
+            if key in mps.DEFAULTS:
+                self.assertEqual(self.values[key], mps.DEFAULTS[key])
+
+    def test_template_holds_no_secret_pattern(self):
+        self.assertEqual([f for f in mps.scan_text("env.example", self.text) if not f["confirmable"]], [])
+
+
+class EnvFillGuideTests(unittest.TestCase):
+    """R.11.2 / R.11.4."""
+
+    def test_blank_member_keys_in_order_with_links(self):
+        guide = mps.env_fill_guide({"MPS_JIRA_PROJECT_KEY": " "}, "https://jira.example/", "https://git.example")
+        self.assertEqual([g["key"] for g in guide], list(mps.MEMBER_KEYS))
+        links = dict((g["key"], g["link"]) for g in guide)
+        self.assertEqual(links["MPS_JIRA_PAT"], "https://jira.example" + mps.JIRA_PAT_PAGE)
+        self.assertEqual(links["MPS_GITLAB_PAT"], "https://git.example/-/user_settings/personal_access_tokens"
+                                                  "?name=mps-git-flow&scopes=api,write_repository")
+        self.assertIsNone(links["MPS_JIRA_PROJECT_KEY"])
+        self.assertTrue(all(g["label"] and g["steps"] for g in guide))
+
+    def test_subset_is_ordered_and_tokens_never_copied(self):
+        values = {"MPS_JIRA_PAT": "super-secret-jira", "MPS_GITLAB_PAT": "super-secret-gitlab"}
+        self.assertEqual([g["key"] for g in mps.env_fill_guide(values, "https://j", "https://g")],
+                         ["MPS_JIRA_PROJECT_KEY"])
+        guide = mps.env_fill_guide(values, "https://j", "https://g", keys=["MPS_GITLAB_PAT", "MPS_JIRA_PAT"],
+                                   token_rejected=True)
+        self.assertEqual([g["key"] for g in guide], ["MPS_JIRA_PAT", "MPS_GITLAB_PAT"])
+        self.assertTrue(all("hết hạn" in g["steps"][0] for g in guide))
+        dumped = json.dumps(guide, ensure_ascii=False)
+        self.assertNotIn("super-secret", dumped)
+
+    def test_deleted_default_line_is_restored(self):
+        guide = mps.env_fill_guide({}, "https://j", "https://g", keys=["MPS_GITLAB_URL"])
+        self.assertEqual(guide[0]["steps"], ["Khôi phục dòng mặc định trong file .env: "
+                                             "MPS_GITLAB_URL=https://git-gst.mto.zing.vn"])
+
+
+def _script_functions(text, names, start, end):
+    """Source of the named functions, copied from a bootstrap script (each starts on the line beginning with
+    `start % name` and ends at the first following line equal to `end`)."""
+    lines = text.splitlines()
+    blocks = []
+    for name in names:
+        first = [i for i, line in enumerate(lines) if line.startswith(start % name)][0]
+        last = lines.index(end, first)
+        blocks.append("\n".join(lines[first:last + 1]))
+    return "\n\n".join(blocks)
+
+
+def _pipe_close_seconds(command):
+    """Seconds until the command's stdout pipe reaches EOF (not just until the command exits), and its output."""
+    started = time.monotonic()
+    proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=BOOTSTRAP_TIMEOUT_SECONDS)
+    return time.monotonic() - started, proc.stdout.decode("utf-8", "replace")
+
+
+def _run_bootstrap(command, env=None):
+    proc = subprocess.run(command, capture_output=True, timeout=BOOTSTRAP_TIMEOUT_SECONDS, env=env)
+    lines = [line for line in proc.stdout.decode("utf-8").splitlines() if line.strip()]
+    return proc.returncode, lines
+
+
+class BootstrapScriptTests(unittest.TestCase):
+    """B1 / B2: detect-only prints one JSON line; on a test machine Python is present."""
+
+    def check_detect_only(self, command, expected_os):
+        code, lines = _run_bootstrap(command)
+        self.assertEqual(len(lines), 1, lines)
+        result = json.loads(lines[0])
+        for key in BOOTSTRAP_KEYS:
+            self.assertIn(key, result)
+        self.assertEqual((result["os"], result["mode"]), (expected_os, "detect"))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(code, 0)
+        version = subprocess.run([result["python_cmd"], "--version"], capture_output=True, timeout=60)
+        self.assertEqual(version.returncode, 0)
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("powershell.exe"), "Windows PowerShell only")
+    def test_ps1_detect_only(self):
+        self.check_detect_only(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", BOOTSTRAP_PS1,
+                                "-DetectOnly"], "windows")
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("powershell.exe"), "Windows PowerShell only")
+    def test_ps1_survives_a_missing_drive_on_path(self):
+        """C1: a PATH entry on a drive that does not exist must not turn detection into bootstrap_failed."""
+        env = dict(os.environ)
+        env["PATH"] = "Q:\\nope;" + env.get("PATH", "")
+        code, lines = _run_bootstrap(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                      BOOTSTRAP_PS1, "-DetectOnly"], env)
+        self.assertEqual(len(lines), 1, lines)
+        result = json.loads(lines[0])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(code, 0)
+
+    @unittest.skipUnless(sys.platform.startswith("win") and shutil.which("powershell.exe"), "Windows PowerShell only")
+    def test_ps1_timed_out_installer_does_not_hold_stdout(self):
+        """N1: a winget still running after the budget must not keep the agent's stdout pipe open."""
+        folder = tempfile.mkdtemp(prefix="mps-ps1-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        functions = _script_functions(_read_bytes(BOOTSTRAP_PS1).decode("utf-8-sig"),
+                                      ("Write-Log", "Invoke-Detached"), "function %s(", "}")
+        ping = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "PING.EXE")
+        harness = os.path.join(folder, "harness.ps1")
+        with open(harness, "wb") as handle:
+            handle.write(UTF8_BOM + "\r\n".join([
+                "$ErrorActionPreference = 'Stop'",
+                "$script:LogPath = '%s'" % os.path.join(folder, "install.log"),
+                functions,
+                "$quick = Invoke-Detached '%s' '-n 1 127.0.0.1' 30000" % ping,
+                "$slow = Invoke-Detached '%s' '-n %d 127.0.0.1' 500" % (ping, SLOW_INSTALLER_SECONDS),
+                "[Console]::Out.WriteLine('{\"quick\":' + $quick.Code + ',\"slow_timed_out\":' + "
+                "([string]$slow.TimedOut).ToLower() + '}')",
+                "exit 0", ""]).encode("utf-8"))
+        elapsed, out = _pipe_close_seconds(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                            harness])
+        self.assertEqual(json.loads(out.strip()), {"quick": 0, "slow_timed_out": True})
+        self.assertLess(elapsed, PIPE_CLOSE_MAX_SECONDS)
+        with open(os.path.join(folder, "install.log"), "rb") as handle:
+            self.assertIn(b"127.0.0.1", handle.read())
+
+    @unittest.skipUnless(shutil.which("sh"), "needs sh")
+    def test_sh_timed_out_installer_does_not_hold_stdout(self):
+        """N1: an installer still running after the budget must not keep the agent's stdout pipe open."""
+        folder = tempfile.mkdtemp(prefix="mps-sh-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        functions = _script_functions(_read_bytes(BOOTSTRAP_SH).decode("utf-8"),
+                                      ("log", "now_seconds", "remaining_seconds", "run_install"), "%s() {", "}")
+        harness = os.path.join(folder, "harness.sh")
+        with open(harness, "wb") as handle:
+            handle.write("\n".join([
+                "LOG_PATH=/dev/null", "INSTALL_BUDGET_SECONDS=1", "MIN_INSTALL_SECONDS=0", functions,
+                "START_SECONDS=$(now_seconds)",
+                "run_install sleep %d" % SLOW_INSTALLER_SECONDS,
+                "printf '{\"status\":\"%s\"}\\n' \"$INSTALL_STATUS\"", "exit 0", ""]).encode("utf-8"))
+        elapsed, out = _pipe_close_seconds(["sh", harness])
+        self.assertEqual(json.loads(out.strip()), {"status": "timeout"})
+        self.assertLess(elapsed, PIPE_CLOSE_MAX_SECONDS)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "POSIX only")
+    def test_sh_detect_only(self):
+        self.check_detect_only(["sh", BOOTSTRAP_SH, "--detect-only"],
+                               "macos" if sys.platform == "darwin" else "linux")
 
 
 if __name__ == "__main__":

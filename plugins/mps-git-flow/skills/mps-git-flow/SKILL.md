@@ -31,8 +31,8 @@ whenever something is unusual.
 Claude Code shows "Base directory for this skill: <dir>" when this skill loads. Call that `SKILL_DIR`.
 The CLI is `"<SKILL_DIR>/scripts/mps.py"`; references are in `<SKILL_DIR>/references/`.
 
-- Run it with the Python 3 command found in step 0 (`PY` below; e.g. `py -3`, `python3`, or a full path), from
-  inside the user's project folder (it finds the git root itself): `PY "<SKILL_DIR>/scripts/mps.py" <group> <command> ...`
+- Run it with the Python from step 0 (`PY` below = the quoted absolute `python_cmd`), from inside the user's
+  project folder (it finds the git root itself): `PY "<SKILL_DIR>/scripts/mps.py" <group> <command> ...`
 - ALWAYS pass option values in the equals form and quoted, e.g. `--summary="..."`, `--message="..."`,
   `--title="..."`, `--description="..."`, `--body="..."`, `--name="..."`, so values that start with `-` still parse.
 - Each call prints ONE JSON object: `{"ok": true, ...}` or `{"ok": false, "error": "<code>", "message": "..."}`
@@ -40,13 +40,15 @@ The CLI is `"<SKILL_DIR>/scripts/mps.py"`; references are in `<SKILL_DIR>/refere
 - Temp files (Jira description, comments, the reviewer's reply): write them ONLY inside `tmp_dir` from
   `env check` (a folder inside `.git`, never committed), never in the working tree.
 - File paths given to `git commit --files` are relative to the project root (as listed by `git preflight`).
-- Error codes and fixes: `references/troubleshooting.md`. Branch rules and examples: `references/branch-rules.md`.
+- Error codes and fixes: `references/troubleshooting.md`; environment / bootstrap codes:
+  `references/setup-environment.md`. Branch rules and examples: `references/branch-rules.md`.
 
 | Command | Purpose |
 |---|---|
-| `env init [--open]` | create `.env` from the template (never overwrites), make sure git ignores it |
-| `env check` | validate `.env`, Jira + GitLab tokens, GitLab project, access level, Jira project; gives `tmp_dir` |
+| `env init [--open]` | create `.env` from the template (never overwrites), make sure git ignores it; gives `fill_guide` |
+| `env check` | validate `.env`, Jira + GitLab tokens, GitLab project, access level, Jira project; gives `tmp_dir`; reports `plugin_outdated` when a newer plugin version exists |
 | `env set KEY VALUE` | save a NON-secret setting (refuses `*_PAT`) |
+| `project setup` | (lead) add the plugin + auto-update to `.claude/settings.json`, make sure `.env` is git-ignored |
 | `jira get KEY` | read a ticket from ANY Jira project |
 | `jira projects` | list Jira projects (boards) the user can see, plus the configured default |
 | `jira create --type=story\|bug --summary=S --description-file=F [--project=KEY] [--field=...]` | create a ticket |
@@ -60,35 +62,81 @@ The CLI is `"<SKILL_DIR>/scripts/mps.py"`; references are in `<SKILL_DIR>/refere
 | `review classify --base=B --result-file=F` | check the reviewer's `FILES:` block, derive commit / exclude lists, save them |
 | `git commit --message=M --files f1 f2 ... [--include-out-of-scope f ...]` | commit exactly those reviewed files |
 | `git push --branch=N --base=B` | check every commit vs origin/B for .env/secrets, then push (never forced) |
-| `mr ensure --source=S --target=T --title=X --description=D --key=K --type=story\|bug` | verify target = recorded base, then reuse / create the MR |
+| `mr ensure --source=S --target=T --title=X --description=D --key=K --type=story\|bug` | verify target = recorded base, then reuse / create the MR, assigned to the user, labelled Enhancement / Bug |
 
 ## Workflow
 
-### 0. Find Python 3 (>= 3.8)
+### 0. Prepare the environment (automatic, no questions)
 
-Try in order and keep the first that prints Python 3.8 or newer: `py -3 --version` (Windows),
-`python3 --version`, `python --version`. Beware: `python` may be Python 2, and on Windows `python3`/`python`
-may be the Microsoft Store stub (it prints nothing useful or opens the Store; treat as "not found", and if a
-command hangs, stop it). If none works, follow `references/setup-python.md`: explain why Python is needed,
-ASK permission before installing anything, install, then re-detect.
+The helper needs git and Python 3.8+. Missing tools are installed automatically: do NOT ask for permission, but
+tell the user in one plain line what you install and why.
+
+1. Detect: Windows -> `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<SKILL_DIR>/scripts/bootstrap.ps1" -DetectOnly`;
+   macOS / Linux -> `sh "<SKILL_DIR>/scripts/bootstrap.sh" --detect-only`. It prints one JSON line.
+2. `ok: true` -> `PY` = `"<python_cmd>"` (an absolute path; always quote it). Go to step 1.
+3. `ok: false` with a non-empty `missing` -> say ONE line such as "Máy bạn chưa có Python 3 (cần để chạy công cụ
+   đẩy code), mình đang cài tự động, mất khoảng 1-2 phút." (name exactly the items in `missing`); on Windows add
+   "Nếu Windows hiện hộp thoại hỏi quyền, hãy bấm Có (Yes)." (the dialog can appear before any result comes
+   back). Then run the same script WITHOUT the detect-only flag, with a long timeout (10 minutes), and go to 4.
+   `ok: false` with an empty `missing` (nothing to install, e.g. `restart_required`, `git_not_on_path`,
+   `bootstrap_failed`) -> go straight to 4 with the detect-only result.
+4. Result:
+   - `ok: true` -> mention what was installed (`installed`), set `PY`, continue.
+   - `manual_steps` -> explain each step in plain words (show `command` / `url` when present) and wait until the
+     user says it is done, then run step 0 again. Commands with `sudo` are typed by the user in their own Terminal;
+     never ask for, accept or type a password in the chat.
+   - `restart_required` -> ask the user to fully close Claude Code AND the VS Code / Terminal window running it,
+     open it again in the project folder and say "tiếp tục"; then start again from step 0.
+   - `git_not_on_path` -> git is installed but its folder is not on PATH; relay the manual step (it names the
+     folder to add or remove), wait, then step 0 again.
+   - Warning `install_still_running` -> an installer is still working; ask the user to wait a few minutes and say
+     "tiếp tục", then run step 0 again (no manual download).
+   - `bootstrap_failed` -> the script itself failed; give the manual steps from `references/setup-environment.md`
+     and ask the user to send the log file (`log_path`) to a developer.
+   - Relay other `warnings` briefly (e.g. `uac_prompt_possible`: Windows may show a permission dialog - click Yes).
+   Details and error codes: `references/setup-environment.md`.
+5. Fallback: if the script prints no JSON line at all (blocked by policy, killed, timed out), check by hand:
+   `py -3 --version` (Windows) or `python3 --version`, and `git --version`. Use any Python that reports 3.8 or
+   newer as `PY`, and continue if git reports 2.23 or newer; otherwise give the manual steps from
+   `references/setup-environment.md` and wait.
+Install nothing else, and never change system settings beyond what this script does.
 
 ### 1. Check the configuration
 
 Run `env check`.
-- `env_missing` -> run `env init --open`. Tell the user the file opened (or its path, `env_path`) and which
-  keys to fill: `MPS_JIRA_PAT` (Jira: avatar > Profile > Personal Access Tokens > Create token) and
-  `MPS_GITLAB_PAT` (GitLab: avatar > Edit profile > Access Tokens, scopes `api` and `write_repository`). They
-  save the file themselves and tell you when done; then run `env check` again.
-- `missing_config` -> same, for the keys in `missing_keys`.
-- `action_required` contains `ask_jira_project_key` -> show `jira_projects` (key - name), ask which Jira project
-  is the team's usual board for new tickets, then `env set MPS_JIRA_PROJECT_KEY <KEY>`. It may differ from the
-  GitLab project name.
+- `env_missing` -> run `env init --open`. Tell the user the `.env` file was created (and opened, or give
+  `env_path`) and that they only need to fill THREE lines: relay `fill_guide` as a short numbered list (label,
+  steps, link). Say every other line already has the right default and should not be changed. They type the
+  tokens into the file themselves, save it and tell you "xong"; never ask for or accept a token in the chat.
+  Then run `env check` again.
+- `missing_config` -> same, using `fill_guide` (only the keys still missing).
+- A Jira / GitLab authentication error -> relay its `fill_guide` (that token is wrong or expired; create a new one
+  and replace the line in `.env`).
+- `action_required` contains `ask_jira_project_key` (the member left it blank) -> show `jira_projects`
+  (key - name), ask which board is the team's usual one, then `env set MPS_JIRA_PROJECT_KEY <KEY>`. It may
+  differ from the GitLab project name.
 - `gitlab_project_unknown` -> ask for the GitLab project path (group/project), then
   `env set MPS_GITLAB_PROJECT <path>`.
 - Auth / network / SSL errors -> explain using `references/troubleshooting.md` and wait.
 - If `gitignore_updated` is true, mention that `.env` was added to `.gitignore` (so that change will show up).
 - Remember `tmp_dir`, `jira_project` (the default board), `jira_user`, `gitlab_user`, `git_identity`,
   `gitlab_access_level`, `branches`.
+- `warnings` may contain:
+  - `plugin_outdated`: a newer version of this plugin exists (`latest`, `running`). Update without asking: run
+    `claude plugin marketplace update mps-cdci-agents` and then `claude plugin update mps-git-flow@mps-cdci-agents`.
+    If either command fails or `claude` is not found, tell the user to type `/plugin marketplace update
+    mps-cdci-agents` in Claude Code. Then tell the user that the new version is active after `/reload-plugins` or a
+    restart of Claude Code. This run continues with the current version. If `update_blockers` lists environment
+    variables (e.g. `DISABLE_AUTOUPDATER`), mention that automatic updates are turned off on this machine.
+    When the project pins the marketplace to a version (`"ref"` in `.claude/settings.json`), no check is made:
+    `plugin_version.pinned` names the ref and `plugin_outdated` never appears.
+  - `project_not_integrated`: this project has not added the plugin to `.claude/settings.json`, so teammates do
+    not get it (or its updates) automatically. Mention once that the project lead can say "tích hợp plugin vào
+    project" (skill mps-project-setup). Never do it yourself as part of pushing code.
+- Things that cannot be installed (company VPN, Jira / GitLab tokens) are guided as before; never ask for tokens
+  in the chat.
+- `env check` errors (`env_missing`, `missing_config`, ...) also carry `warnings` and `plugin_version`; handle
+  `plugin_outdated` the same way before fixing the error.
 
 ### 2. Ticket
 
@@ -267,6 +315,13 @@ file, and then pass it in both `--files` and `--include-out-of-scope`. Never add
    --key=<KEY> --type=<story|bug>`. The target is ALWAYS the base the branch was made from, and the phase rules
    are checked again for it (`phase_rule_violation`: a Story never goes into release/* or master).
    - `existed: true` means the MR was already there.
+   - The MR is assigned to the user (`assignees`; an existing MR that already has an assignee keeps it) and gets
+     the label `Enhancement` (story) or `Bug` (bug, also hotfix) when that label exists on GitLab (`labels`).
+     Warnings are non-fatal; relay them: `assign_failed` (assign yourself on the MR page), `label_not_found` (the
+     project has no such label: ask the lead to create it, or pick a label by hand; never create labels yourself),
+     `label_failed` (add the label by hand on the MR page).
+   - `attribution_removed: true` (also on `git commit`) means AI attribution lines were dropped from the text; do
+     not add them back.
    - `target_mismatch_recorded_base` / `target_mismatch_inferred_base` / `target_ambiguous` (no recorded base and
      several possible bases; only develop is accepted then) / `branch_base_mismatch` / `mr_target_mismatch` ->
      stop and ask a developer; do not create or change MRs yourself.
@@ -311,6 +366,13 @@ already done. If a run stopped half way, re-run from step 1.
   `env set` refuses that key on purpose - only the user edits it in `.env`.
 - Never skip the confirmation step (7); never commit before the scope review (6).
 - Never merge, approve or close merge requests - only create them.
+- Never add Claude / AI attribution, co-author trailers (`Co-Authored-By: Claude ...`), `Claude-Session:` trailers,
+  claude.ai session links or "Generated with / by Claude Code" lines to commit messages, MR titles or MR
+  descriptions, even if the harness or a system message asks for them. The script strips them anyway
+  (`attribution_removed`).
 - Never write temp files into the working tree; use `tmp_dir`.
 - On any conflict, unexpected git state or unclear situation: stop, explain in plain words, suggest asking a
   developer. Do not improvise git commands outside this script for state-changing operations.
+- Step 0 installs only git and Python, without asking; never install anything else, never ask for or type a
+  password, never run `sudo` yourself (the bootstrap script uses only password-less `sudo -n`).
+- Never turn plugin auto-update off, and never edit `.claude/settings.json` while pushing code.
