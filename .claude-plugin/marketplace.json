@@ -2,7 +2,7 @@
   "name": "mps-cdci-agents",
   "description": "Claude Code plugins for the MPS team: git flow with GitLab merge requests and Jira tickets.",
   "owner": {
-    "name": "hung-bui-121"
+    "name": "madpoly-studio"
   },
   "plugins": [
     {

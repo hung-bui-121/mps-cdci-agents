@@ -1,4 +1,4 @@
-# mps-cdci-agents
+# mps-cicd-agent-flow
 
 Bộ plugin Claude Code cho team MPS. Hiện có một plugin:
 
@@ -55,7 +55,7 @@ trên Windows vốn đã cần Git for Windows).
 Dùng khi project chưa được tích hợp, hoặc trên máy riêng của lead. Trong Claude Code, gõ:
 
 ```
-/plugin marketplace add hung-bui-121/mps-cdci-agents
+/plugin marketplace add madpoly-studio/mps-cicd-agent-flow
 /plugin install mps-git-flow@mps-cdci-agents
 ```
 
@@ -151,7 +151,7 @@ Làm một lần cho mỗi project để cả team tự có plugin (và các b�
        "mps-cdci-agents": {
          "source": {
            "source": "github",
-           "repo": "hung-bui-121/mps-cdci-agents"
+           "repo": "madpoly-studio/mps-cicd-agent-flow"
          },
          "autoUpdate": true
        }
@@ -304,6 +304,21 @@ lý hỏi đáp để tạo quy tắc, và cách để developer cho phép bỏ 
 - Bật/tắt auto-update trong màn hình `/plugin` sẽ ghi vào `.claude/settings.json` của project. Đừng commit thay đổi
   đó (review phạm vi sẽ để nó ngoài commit, trừ khi ticket nói về việc này).
 - Máy đã cài bản 0.1.0 bằng tay cần cập nhật tay **một lần** để lên 0.1.1 (bản 0.1.0 chưa tự kiểm tra phiên bản).
+
+### Chuyển repo (từ 0.2.1)
+
+Từ bản 0.2.1, plugin nằm ở repo của tổ chức `madpoly-studio/mps-cicd-agent-flow` (trước đây là
+`hung-bui-121/mps-cdci-agents`). Tên marketplace vẫn là `mps-cdci-agents` và tên plugin vẫn là
+`mps-git-flow@mps-cdci-agents`, nên cấu hình `enabledPlugins` của các project không đổi.
+
+- Project đã tích hợp: lead chạy lại `project setup` (hoặc nói "tích hợp plugin vào project"). Lệnh này đổi `repo`
+  của marketplace trong `.claude/settings.json` sang repo mới (giữ nguyên `ref` nếu có, báo
+  `marketplace_source_migrated`), rồi commit file đó qua mps-git-flow như lần tích hợp đầu.
+- Máy đã cài tay từ repo cũ: gõ `/plugin marketplace remove mps-cdci-agents`, rồi
+  `/plugin marketplace add madpoly-studio/mps-cicd-agent-flow` và `/plugin install mps-git-flow@mps-cdci-agents`.
+  Nếu sau khi project đã đổi nguồn mà `/plugin` (tab Marketplaces) vẫn hiện repo cũ, làm các bước này.
+- Bản 0.2.0 trở về trước chỉ kiểm tra phiên bản mới ở repo cũ. Để các máy này tự thấy 0.2.1, repo cũ cần được
+  cập nhật lên 0.2.1 một lần (sau đó ngừng cập nhật); nếu không, mỗi máy phải chuyển sang repo mới bằng tay như trên.
 
 ## Phát hành phiên bản mới (người phát triển plugin)
 

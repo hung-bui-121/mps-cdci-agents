@@ -23,6 +23,8 @@ Speak Vietnamese, plain words, as in mps-git-flow. `GITFLOW_DIR` = `<SKILL_DIR>/
      step 3 if `review_rules` is `absent`).
    - `changed: false` with a non-empty `files_to_commit`: the settings were written earlier but are not committed
      yet; continue with step 3 and the commit in step 5.
+   - Change `marketplace_source_migrated`: the marketplace pointed to the old repo `hung-bui-121/mps-cdci-agents` and
+     now points to `madpoly-studio/mps-cicd-agent-flow` (a pinned `ref` is kept); say so and commit it in step 5.
    - Warnings: `marketplace_source_differs` (an existing, different source is kept - confirm with the lead that this
      is intended), `settings_ignored_by_git` (the lead must remove that ignore line, or members never get the file),
      `attribution_kept` (the project already sets its own attribution text; it is kept - the helper script still

@@ -3,6 +3,13 @@
 Mỗi lần merge vào `main` phải tăng phiên bản (`VERSION` trong `mps.py` và `version` trong `plugin.json`, cùng một
 giá trị) và thêm một mục ở đây. Mục mới nhất ở trên cùng.
 
+## 0.2.1 - 2026-11-07
+- Chuyển plugin sang repo của tổ chức `madpoly-studio/mps-cicd-agent-flow` (trước đây `hung-bui-121/mps-cdci-agents`).
+  Tên marketplace `mps-cdci-agents` và plugin `mps-git-flow@mps-cdci-agents` giữ nguyên.
+- Kiểm tra phiên bản mới đọc `plugin.json` từ repo mới.
+- `project setup`: marketplace còn trỏ tới repo cũ được tự đổi sang repo mới, giữ nguyên `ref` (thay đổi
+  `marketplace_source_migrated`, không còn cảnh báo `marketplace_source_differs`).
+
 ## 0.2.0 - 2026-11-06
 - Review code theo quy tắc, chạy song song với review phạm vi trên cùng một bundle (cùng `Bundle-ID`): quy tắc
   chung của team, quy tắc theo công nghệ tự nhận ra (`unity-csharp`, `python`, `web`, tính từ thư mục của từng

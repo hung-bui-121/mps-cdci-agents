@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Unit tests for the pure functions of plugins/mps-git-flow/skills/mps-git-flow/scripts/mps.py (no network, no git)."""
 
+import copy
 import importlib.util
 import io
 import json
@@ -2191,7 +2192,7 @@ BOOTSTRAP_PS1 = os.path.join(SCRIPTS_DIR, "bootstrap.ps1")
 BOOTSTRAP_SH = os.path.join(SCRIPTS_DIR, "bootstrap.sh")
 UTF8_BOM = b"\xef\xbb\xbf"
 NEW_SETTINGS_CHANGES = ["marketplace_added", "plugin_enabled", "attribution_disabled"]
-EXPECTED_MARKETPLACE = {"source": {"source": "github", "repo": "hung-bui-121/mps-cdci-agents"}, "autoUpdate": True}
+EXPECTED_MARKETPLACE = {"source": {"source": "github", "repo": "madpoly-studio/mps-cicd-agent-flow"}, "autoUpdate": True}
 BOOTSTRAP_KEYS = ("ok", "os", "python_cmd", "missing", "manual_steps")
 BOOTSTRAP_TIMEOUT_SECONDS = 120
 # A fake installer outlives the tiny test budget by far; the pipe must close long before it ends.
@@ -2289,7 +2290,7 @@ class MergeProjectSettingsTests(unittest.TestCase):
 
     def test_existing_entry_auto_update_turned_on(self):
         settings = {"extraKnownMarketplaces": {"mps-cdci-agents": {
-            "source": {"source": "github", "repo": "hung-bui-121/mps-cdci-agents"}, "autoUpdate": False}},
+            "source": {"source": "github", "repo": "madpoly-studio/mps-cicd-agent-flow"}, "autoUpdate": False}},
             "enabledPlugins": {"mps-git-flow@mps-cdci-agents": False}}
         merged, changes, warnings = mps.merge_project_settings(settings)
         self.assertEqual(changes, ["auto_update_enabled", "plugin_enabled", "attribution_disabled"])
@@ -2298,11 +2299,36 @@ class MergeProjectSettingsTests(unittest.TestCase):
         self.assertIs(merged["enabledPlugins"]["mps-git-flow@mps-cdci-agents"], True)
 
     def test_pinned_ref_is_not_a_different_source(self):
-        entry = {"source": {"source": "github", "repo": "hung-bui-121/mps-cdci-agents", "ref": "v0.1.1"},
+        entry = {"source": {"source": "github", "repo": "madpoly-studio/mps-cicd-agent-flow", "ref": "v0.1.1"},
                  "autoUpdate": True}
         merged, changes, warnings = mps.merge_project_settings({"extraKnownMarketplaces": {"mps-cdci-agents": entry}})
         self.assertEqual((changes, warnings), (["plugin_enabled", "attribution_disabled"], []))
         self.assertEqual(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["source"]["ref"], "v0.1.1")
+
+    def test_legacy_repo_is_migrated_keeping_ref(self):
+        for legacy in mps.LEGACY_MARKETPLACE_REPOS:
+            for extra in ({}, {"ref": "v0.1.1"}):
+                source = dict({"source": "github", "repo": legacy}, **extra)
+                settings = {"extraKnownMarketplaces": {"mps-cdci-agents": {"source": source, "autoUpdate": True}},
+                            "enabledPlugins": {"mps-git-flow@mps-cdci-agents": True}, "attribution": False}
+                original = copy.deepcopy(settings)
+                merged, changes, warnings = mps.merge_project_settings(settings)
+                self.assertEqual((changes, warnings), (["marketplace_source_migrated"], []))
+                self.assertEqual(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["source"],
+                                 dict({"source": "github", "repo": mps.MARKETPLACE_REPO}, **extra))
+                self.assertEqual(settings, original)
+
+    def test_legacy_repo_migration_edge_cases(self):
+        upper = {"source": {"source": "github", "repo": "Hung-Bui-121/MPS-CDCI-Agents"}, "autoUpdate": False}
+        merged, changes, warnings = mps.merge_project_settings({"extraKnownMarketplaces": {"mps-cdci-agents": upper}})
+        self.assertEqual((changes[:2], warnings), (["marketplace_source_migrated", "auto_update_enabled"], []))
+        self.assertEqual(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["source"]["repo"], mps.MARKETPLACE_REPO)
+        extra = {"source": "github", "repo": mps.LEGACY_MARKETPLACE_REPOS[0], "path": "x"}
+        merged, changes, warnings = mps.merge_project_settings(
+            {"extraKnownMarketplaces": {"mps-cdci-agents": {"source": extra, "autoUpdate": True}}})
+        self.assertNotIn("marketplace_source_migrated", changes)
+        self.assertEqual([w["code"] for w in warnings], ["marketplace_source_differs"])
+        self.assertEqual(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["source"], extra)
 
     def test_different_source_is_kept_and_reported(self):
         local = {"source": "directory", "path": "D:/work/mps-cdci-agents"}

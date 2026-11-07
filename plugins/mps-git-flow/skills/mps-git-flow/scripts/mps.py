@@ -41,7 +41,7 @@ import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 USER_AGENT = "mps-git-flow/" + VERSION
 
 EXIT_FAILURE = 1
@@ -83,7 +83,9 @@ GITLAB_PAT_PAGE = "/-/user_settings/personal_access_tokens?name=mps-git-flow&sco
 
 # Plugin integration into a project (lead) and the plugin version check.
 MARKETPLACE_NAME = "mps-cdci-agents"
-MARKETPLACE_REPO = "hung-bui-121/mps-cdci-agents"
+MARKETPLACE_REPO = "madpoly-studio/mps-cicd-agent-flow"
+# GitHub repos the marketplace used to live in. A project still pointing to one is moved to MARKETPLACE_REPO.
+LEGACY_MARKETPLACE_REPOS = ("hung-bui-121/mps-cdci-agents",)
 PLUGIN_KEY = "mps-git-flow@mps-cdci-agents"
 PROJECT_SETTINGS_PATH = ".claude/settings.json"
 # Claude Code's `attribution` setting with every part hidden, in the form older Claude Code versions also accept
@@ -91,7 +93,7 @@ PROJECT_SETTINGS_PATH = ".claude/settings.json"
 HIDDEN_ATTRIBUTION = {"commit": "", "pr": "", "sessionUrl": False}
 # GitLab label per ticket type (hotfix tickets are bugs).
 MR_LABELS = {"story": "Enhancement", "bug": "Bug"}
-PLUGIN_MANIFEST_URL = ("https://raw.githubusercontent.com/hung-bui-121/mps-cdci-agents/main/"
+PLUGIN_MANIFEST_URL = ("https://raw.githubusercontent.com/" + MARKETPLACE_REPO + "/main/"
                        "plugins/mps-git-flow/.claude-plugin/plugin.json")
 VERSION_CHECK_TIMEOUT_SECONDS = 3
 MANIFEST_MAX_BYTES = 64 * 1024
@@ -467,8 +469,9 @@ def _describe_source(source):
 def merge_project_settings(settings):
     """Add the marketplace (auto-update on) and enable the plugin. Returns (new_settings, changes, warnings).
 
-    The input is never mutated; existing keys keep their order and new keys are appended. A marketplace entry with
-    another source (a fork, a local directory) is kept as it is and reported.
+    The input is never mutated; existing keys keep their order and new keys are appended. A marketplace entry that
+    still points to a legacy repo (LEGACY_MARKETPLACE_REPOS) is moved to MARKETPLACE_REPO, keeping its `ref`; an
+    entry with another source (a fork, a local directory) is kept as it is and reported.
     """
     merged = copy.deepcopy(settings)
     changes = []
@@ -485,7 +488,13 @@ def merge_project_settings(settings):
             raise _settings_conflict("extraKnownMarketplaces." + MARKETPLACE_NAME)
         source = entry.get("source")
         unpinned = dict((k, v) for k, v in source.items() if k != "ref") if isinstance(source, dict) else source
-        if unpinned != _expected_marketplace_source():
+        legacy = (isinstance(unpinned, dict) and set(unpinned) == {"source", "repo"}
+                  and unpinned["source"] == "github" and isinstance(unpinned["repo"], str)
+                  and unpinned["repo"].lower() in LEGACY_MARKETPLACE_REPOS)  # GitHub names ignore case
+        if legacy:
+            source["repo"] = MARKETPLACE_REPO
+            changes.append("marketplace_source_migrated")
+        elif unpinned != _expected_marketplace_source():
             warnings.append({"code": "marketplace_source_differs", "source": source,
                              "message": "Marketplace %s trong %s đang trỏ tới nguồn khác (%s); giữ nguyên nguồn đó."
                                         % (MARKETPLACE_NAME, PROJECT_SETTINGS_PATH, _describe_source(source))})
