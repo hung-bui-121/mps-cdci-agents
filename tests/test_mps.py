@@ -3304,6 +3304,7 @@ class CodeReviewPromptTests(unittest.TestCase):
 
     def test_prompt_examples_parse(self):
         text = _read_bytes(os.path.join(SCRIPTS_DIR, "..", "references", "code-review-prompt.md")).decode("utf-8")
+        text = text.replace("\r\n", "\n")  # a Windows checkout with core.autocrlf has CRLF line endings
         section = text[text.index("## Required output format"):]
         blocks = re.findall(r"```\n(.*?)```", section, re.DOTALL)
         entries, bundle_id = mps.parse_findings(blocks[0])
