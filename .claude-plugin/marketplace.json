@@ -1,0 +1,14 @@
+{
+  "name": "mps-cdci-agents",
+  "description": "Claude Code plugins for the MPS team: git flow with GitLab merge requests and Jira tickets.",
+  "owner": {
+    "name": "hung-bui-121"
+  },
+  "plugins": [
+    {
+      "name": "mps-git-flow",
+      "source": "./plugins/mps-git-flow",
+      "description": "Commit & push code lên GitLab MPS theo đúng quy trình ticket Jira: tạo/tra cứu ticket, tạo nhánh, review phạm vi thay đổi, review code theo quy tắc của team và dự án (.mps/review.md), commit, push, tạo merge request và cập nhật Jira."
+    }
+  ]
+}
