@@ -7,6 +7,7 @@ Each script failure has an `error` code, a Vietnamese `message` and often `servi
 
 | error | Meaning | What to do |
 |---|---|---|
+| `plugin_source_legacy` | This machine installs the plugin from the old personal repo (`marketplaces`); every command except `project setup` stops | Relay `message`; with the user's consent run `commands` in order (remove, add the shared repo, install), else the user types the `/plugin ...` commands from `message`; then `/reload-plugins` |
 | `not_git_repo` | Not inside a git project | Ask the user to open Claude Code in the project folder |
 | `env_missing` | No `.env` at the project root (`next`: `env init --open`) | `env init --open`, then relay its `fill_guide`: the user fills only `MPS_JIRA_PAT`, `MPS_JIRA_PROJECT_KEY`, `MPS_GITLAB_PAT` |
 | `missing_config` | Keys in `missing_keys` are empty | Relay `fill_guide` (steps per key); the user fills tokens in `.env` themselves, non-secret keys via `env set` |
@@ -26,6 +27,7 @@ a developer must remove it from git (`git rm --cached .env`) and the tokens must
 | warning | Meaning | What to do |
 |---|---|---|
 | `plugin_outdated` | A newer mps-git-flow exists on GitHub (`latest`, `running`) | Run the two `commands` (`claude plugin marketplace update mps-cdci-agents`, `claude plugin update mps-git-flow@mps-cdci-agents`); if they fail, the user types `/plugin marketplace update mps-cdci-agents`. The new version is active after `/reload-plugins` or a restart. `update_blockers` lists env vars that turned automatic updates off (`DISABLE_UPDATES`, `DISABLE_AUTOUPDATER`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; `FORCE_AUTOUPDATE_PLUGINS=1` turns plugin updates back on) |
+| `legacy_project_source` | The project's `.claude/settings.json` still declares the marketplace from the old personal repo; members cannot leave it until the project moves | The lead runs `project setup` (skill mps-project-setup) and commits `.claude/settings.json` |
 | `project_not_integrated` | The project's `.claude/settings.json` does not enable the plugin, so teammates do not get it automatically | Mention once that the lead can say "tích hợp plugin vào project" (skill mps-project-setup). Never change the file while pushing code |
 
 The version check reads `plugin.json` from GitHub (3 s in total, no token sent, `MPS_CA_BUNDLE` trusted in

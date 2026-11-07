@@ -317,8 +317,28 @@ Từ bản 0.2.1, plugin nằm ở repo của tổ chức `madpoly-studio/mps-ci
 - Máy đã cài tay từ repo cũ: gõ `/plugin marketplace remove mps-cdci-agents`, rồi
   `/plugin marketplace add madpoly-studio/mps-cicd-agent-flow` và `/plugin install mps-git-flow@mps-cdci-agents`.
   Nếu sau khi project đã đổi nguồn mà `/plugin` (tab Marketplaces) vẫn hiện repo cũ, làm các bước này.
-- Bản 0.2.0 trở về trước chỉ kiểm tra phiên bản mới ở repo cũ. Để các máy này tự thấy 0.2.1, repo cũ cần được
-  cập nhật lên 0.2.1 một lần (sau đó ngừng cập nhật); nếu không, mỗi máy phải chuyển sang repo mới bằng tay như trên.
+- Bản 0.2.0 trở về trước chỉ kiểm tra phiên bản mới ở repo cũ. Để các máy này tự thấy bản mới, repo cũ cần được
+  cập nhật cùng bản đó; nếu không, mỗi máy phải chuyển sang repo mới bằng tay như trên.
+
+Từ bản 0.2.2, máy nào còn cài plugin từ repo cũ sẽ **bị chặn cho tới khi gỡ bản cũ**:
+- Khi mở Claude Code, hook `SessionStart` của plugin hiện lời nhắc: team đã thống nhất đưa plugin về repo dùng
+  chung, nên cần gỡ bản cài từ repo cá nhân của hungbt, kèm các lệnh `/plugin` cần gõ.
+- Mọi lệnh của `mps.py` (trừ `project setup`) trả lỗi `plugin_source_legacy` với cùng lời nhắc. Claude đề nghị chạy
+  giúp các lệnh `claude plugin ...` (chỉ chạy khi người dùng đồng ý), rồi nhắc gõ `/reload-plugins`.
+- Ngoại lệ: nếu chính `.claude/settings.json` của project vẫn khai báo repo cũ thì member không bị chặn (gỡ đi
+  cũng sẽ bị cài lại từ repo cũ); thay vào đó `env check` báo `legacy_project_source` để nhắc lead chạy
+  `project setup`. `project setup` không bao giờ bị chặn, để lead luôn chuyển được project.
+- Lead dùng máy còn cài từ repo cũ: `project setup` trả thêm `machine_source_legacy`; lead gỡ bản cũ theo hướng dẫn
+  đó **trước** khi commit `.claude/settings.json` (nếu không, các bước commit sẽ bị chặn), rồi chạy lại
+  `project setup` để chắc file vẫn trỏ repo mới.
+- Mỗi nhánh dài hạn (`develop`, các `release/*` đang mở, nhánh production) có bản `.claude/settings.json` riêng:
+  chạy `project setup` (hoặc merge thay đổi) trên từng nhánh, nếu không member mở Claude Code ở nhánh đó sẽ bị kéo
+  lại repo cũ.
+- Bị chặn giữa chừng một ticket thì không mất gì: sau `/reload-plugins`, Claude làm tiếp từ bước bị dừng.
+- Máy được nhận ra qua file `known_marketplaces.json` của Claude Code (thư mục `~/.claude/plugins`, hoặc
+  `CLAUDE_CODE_PLUGIN_CACHE_DIR` / `CLAUDE_CONFIG_DIR`). Không đọc được file này thì không chặn.
+- Hook chạy bằng bash (Git Bash trên Windows). Tên repo trong `hooks/legacy-source-check.sh` phải khớp
+  `LEGACY_MARKETPLACE_REPOS` / `MARKETPLACE_REPO` trong `mps.py` (có test kiểm tra).
 
 ## Phát hành phiên bản mới (người phát triển plugin)
 
@@ -364,6 +384,8 @@ Kiểm tra thủ công (máy thật, ngoài phần test tự động):
 CHANGELOG.md                               # nhật ký thay đổi theo phiên bản
 plugins/mps-git-flow/
   .claude-plugin/plugin.json               # phiên bản plugin (nguồn duy nhất)
+  hooks/hooks.json                         # hook SessionStart: nhắc gỡ bản cài từ repo cá nhân cũ
+  hooks/legacy-source-check.sh             # script của hook đó (bash)
   skills/mps-git-flow/
     SKILL.md                               # quy trình cho Claude
     scripts/mps.py                         # CLI Python (chỉ thư viện chuẩn), in ra JSON

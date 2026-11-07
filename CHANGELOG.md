@@ -3,6 +3,16 @@
 Mỗi lần merge vào `main` phải tăng phiên bản (`VERSION` trong `mps.py` và `version` trong `plugin.json`, cùng một
 giá trị) và thêm một mục ở đây. Mục mới nhất ở trên cùng.
 
+## 0.2.2 - 2026-11-07
+- Máy còn cài plugin từ repo cá nhân cũ (`hung-bui-121/mps-cdci-agents`, nhận ra qua `known_marketplaces.json`
+  của Claude Code) bị chặn: mọi lệnh `mps.py` trừ `project setup` trả lỗi `plugin_source_legacy`, kèm lời nhắc
+  thân thiện và các lệnh `claude plugin ...` để gỡ bản cũ, thêm repo dùng chung và cài lại.
+- Hook `SessionStart` mới (`hooks/hooks.json`) hiện lời nhắc đó ngay khi mở Claude Code.
+- Project mà `.claude/settings.json` vẫn khai báo repo cũ: member không bị chặn, `env check` báo
+  `legacy_project_source` để nhắc lead chạy `project setup`.
+- `project setup` chuyển mọi dạng nguồn trỏ repo cũ (github, URL git https / ssh) sang repo mới, và báo
+  `machine_source_legacy` khi máy của lead còn cài từ repo cũ (phải gỡ trước khi commit file settings).
+
 ## 0.2.1 - 2026-11-07
 - Chuyển plugin sang repo của tổ chức `madpoly-studio/mps-cicd-agent-flow` (trước đây `hung-bui-121/mps-cdci-agents`).
   Tên marketplace `mps-cdci-agents` và plugin `mps-git-flow@mps-cdci-agents` giữ nguyên.

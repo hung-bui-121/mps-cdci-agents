@@ -775,7 +775,9 @@ class GitFlowTests(unittest.TestCase):
         self.addCleanup(os.chdir, os.getcwd())
         empty_config = os.path.join(self.tmp, "empty.gitconfig")
         open(empty_config, "w").close()
-        env = mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": empty_config, "GIT_CONFIG_NOSYSTEM": "1"})
+        # The machine's own Claude Code plugin registry must not decide whether commands run (plugin_source_legacy).
+        env = mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": empty_config, "GIT_CONFIG_NOSYSTEM": "1",
+                                           mps.PLUGINS_DIR_ENV: os.path.join(self.tmp, "no-plugins")})
         env.start()
         self.addCleanup(env.stop)
         self.origin = os.path.join(self.tmp, "origin.git")
@@ -2323,12 +2325,18 @@ class MergeProjectSettingsTests(unittest.TestCase):
         merged, changes, warnings = mps.merge_project_settings({"extraKnownMarketplaces": {"mps-cdci-agents": upper}})
         self.assertEqual((changes[:2], warnings), (["marketplace_source_migrated", "auto_update_enabled"], []))
         self.assertEqual(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["source"]["repo"], mps.MARKETPLACE_REPO)
-        extra = {"source": "github", "repo": mps.LEGACY_MARKETPLACE_REPOS[0], "path": "x"}
-        merged, changes, warnings = mps.merge_project_settings(
-            {"extraKnownMarketplaces": {"mps-cdci-agents": {"source": extra, "autoUpdate": True}}})
-        self.assertNotIn("marketplace_source_migrated", changes)
-        self.assertEqual([w["code"] for w in warnings], ["marketplace_source_differs"])
-        self.assertEqual(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["source"], extra)
+        # Every form the legacy check recognises is moved, so `legacy_project_source` always has a fix.
+        for legacy, expected in (
+                ({"source": "github", "repo": mps.LEGACY_MARKETPLACE_REPOS[0], "path": "x"},
+                 mps._expected_marketplace_source()),
+                ({"source": "git", "url": "https://github.com/hung-bui-121/mps-cdci-agents.git", "ref": "main"},
+                 dict(mps._expected_marketplace_source(), ref="main"))):
+            merged, changes, warnings = mps.merge_project_settings(
+                {"extraKnownMarketplaces": {"mps-cdci-agents": {"source": legacy, "autoUpdate": True}}})
+            self.assertEqual(changes[:1], ["marketplace_source_migrated"])
+            self.assertEqual(warnings, [])
+            self.assertEqual(merged["extraKnownMarketplaces"]["mps-cdci-agents"]["source"], expected)
+            self.assertFalse(mps.project_declares_legacy_source(merged))
 
     def test_different_source_is_kept_and_reported(self):
         local = {"source": "directory", "path": "D:/work/mps-cdci-agents"}
@@ -3444,6 +3452,209 @@ class BootstrapScriptTests(unittest.TestCase):
     def test_sh_detect_only(self):
         self.check_detect_only(["sh", BOOTSTRAP_SH, "--detect-only"],
                                "macos" if sys.platform == "darwin" else "linux")
+
+
+LEGACY_REPO = "hung-bui-121/mps-cdci-agents"
+HOOKS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "plugins", "mps-git-flow", "hooks")
+LEGACY_HOOK_SH = os.path.join(HOOKS_DIR, "legacy-source-check.sh")
+
+
+def _find_bash():
+    """bash for the hook script; on Windows only Git Bash (what Claude Code runs hooks with), never WSL's bash."""
+    if os.name != "nt":
+        return shutil.which("bash")
+    git = shutil.which("git")
+    if not git:
+        return None
+    folder = os.path.dirname(git)
+    for _ in range(3):
+        folder = os.path.dirname(folder)
+        candidate = os.path.join(folder, "bin", "bash.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+BASH = _find_bash()
+
+
+def _known(source):
+    return {"mps-cdci-agents": {"source": source, "installLocation": "x", "lastUpdated": "2026-11-07T00:00:00Z"}}
+
+
+class LegacyPluginSourceTests(unittest.TestCase):
+    """Machines that still install the plugin from the personal repo must move to the shared repo."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mps-legacy-")
+        self.addCleanup(_rmtree, self.tmp)
+        self.environ = {mps.PLUGINS_DIR_ENV: self.tmp}
+
+    def write_known(self, data):
+        with open(os.path.join(self.tmp, mps.KNOWN_MARKETPLACES_FILE), "w", encoding="utf-8") as handle:
+            handle.write(data if isinstance(data, str) else json.dumps(data))
+
+    def test_points_to_legacy_repo(self):
+        for source in ({"source": "github", "repo": LEGACY_REPO},
+                       {"source": "github", "repo": "Hung-Bui-121/MPS-CDCI-Agents", "ref": "main"},
+                       {"source": "git", "url": "https://github.com/hung-bui-121/mps-cdci-agents.git"},
+                       {"source": "url", "url": "git@github.com:hung-bui-121/mps-cdci-agents.git"}):
+            self.assertTrue(mps.points_to_legacy_repo(source), source)
+        for source in ({"source": "github", "repo": mps.MARKETPLACE_REPO},
+                       {"source": "github", "repo": "someone/hung-bui-121-mps-cdci-agents"},
+                       {"source": "directory", "path": "D:/work/" + LEGACY_REPO},
+                       {"source": "github"}, LEGACY_REPO, None):
+            self.assertFalse(mps.points_to_legacy_repo(source), source)
+
+    def test_known_marketplaces_path(self):
+        self.assertEqual(mps.known_marketplaces_path({mps.PLUGINS_DIR_ENV: "P"}),
+                         os.path.join("P", "known_marketplaces.json"))
+        self.assertEqual(mps.known_marketplaces_path({mps.CLAUDE_CONFIG_DIR_ENV: "C"}),
+                         os.path.join("C", "plugins", "known_marketplaces.json"))
+
+    def test_missing_or_broken_registry_never_blocks(self):
+        self.assertEqual(mps.load_known_marketplaces(self.environ), {})
+        for text in ("{not json", "[1, 2]"):
+            self.write_known(text)
+            self.assertEqual(mps.load_known_marketplaces(self.environ), {})
+
+    def test_status(self):
+        legacy = _known({"source": "github", "repo": LEGACY_REPO})
+        shared = _known({"source": "github", "repo": mps.MARKETPLACE_REPO})
+        project_legacy = {"extraKnownMarketplaces": {"mps-cdci-agents": {"source": {"source": "github",
+                                                                                     "repo": LEGACY_REPO}}}}
+        project_shared = {"extraKnownMarketplaces": {"mps-cdci-agents": {"source": mps._expected_marketplace_source()}}}
+        self.assertEqual(mps.legacy_plugin_source_status(shared, project_legacy), (None, []))
+        self.assertEqual(mps.legacy_plugin_source_status(legacy, None), ("machine", ["mps-cdci-agents"]))
+        self.assertEqual(mps.legacy_plugin_source_status(legacy, project_shared), ("machine", ["mps-cdci-agents"]))
+        self.assertEqual(mps.legacy_plugin_source_status(legacy, project_legacy), ("project", ["mps-cdci-agents"]))
+        self.assertTrue(mps.project_declares_legacy_source(project_legacy))
+        self.assertFalse(mps.project_declares_legacy_source(project_shared))
+        self.assertFalse(mps.project_declares_legacy_source({"extraKnownMarketplaces": []}))
+
+    def run_main(self, argv):
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding="utf-8")
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.tmp)  # not a git project: settings are None
+        with mock.patch.object(sys, "stdout", stream), mock.patch.dict(os.environ, self.environ):
+            code = mps.main(argv)
+        stream.flush()
+        return code, json.loads(buffer.getvalue().decode("utf-8"))
+
+    def test_commands_blocked_with_friendly_message(self):
+        self.write_known(_known({"source": "github", "repo": LEGACY_REPO}))
+        code, result = self.run_main(["jira", "projects"])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(result["error"], "plugin_source_legacy")
+        self.assertEqual(result["marketplaces"], ["mps-cdci-agents"])
+        self.assertEqual(result["commands"], ["claude plugin marketplace remove mps-cdci-agents",
+                                              "claude plugin marketplace add " + mps.MARKETPLACE_REPO,
+                                              "claude plugin install mps-git-flow@mps-cdci-agents"])
+        for text in ("repo dùng chung", "repo cá nhân của hungbt", mps.MARKETPLACE_REPO, LEGACY_REPO,
+                     "/plugin marketplace remove mps-cdci-agents"):
+            self.assertIn(text, result["message"])
+
+    def test_project_setup_is_never_blocked(self):
+        self.write_known(_known({"source": "github", "repo": LEGACY_REPO}))
+        _, result = self.run_main(["project", "setup"])
+        self.assertEqual(result["error"], "not_git_repo")
+
+    def test_shared_source_runs(self):
+        self.write_known(_known({"source": "github", "repo": mps.MARKETPLACE_REPO}))
+        _, result = self.run_main(["jira", "projects"])
+        self.assertNotEqual(result.get("error"), "plugin_source_legacy")
+
+    def make_project(self, source):
+        """A git project in the temp folder whose .claude/settings.json declares the marketplace with `source`."""
+        project = os.path.join(self.tmp, "project")
+        os.makedirs(os.path.join(project, ".claude"), exist_ok=True)
+        subprocess.run(["git", "init", "-q", project], check=True, capture_output=True)
+        with open(os.path.join(project, ".claude", "settings.json"), "w", encoding="utf-8") as handle:
+            json.dump({"extraKnownMarketplaces": {"mps-cdci-agents": {"source": source, "autoUpdate": True}},
+                       "enabledPlugins": {"mps-git-flow@mps-cdci-agents": True}, "attribution": False}, handle)
+        return project
+
+    def run_in(self, folder, argv, extra_env=None):
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding="utf-8")
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(folder)
+        env = dict(self.environ, GIT_CONFIG_NOSYSTEM="1", **(extra_env or {}))
+        with mock.patch.object(sys, "stdout", stream), mock.patch.dict(os.environ, env):
+            mps.main(argv)
+        stream.flush()
+        return json.loads(buffer.getvalue().decode("utf-8"))
+
+    @unittest.skipIf(GIT is None, "git is not installed")
+    def test_project_on_legacy_repo_exempts_members_until_it_moves(self):
+        self.write_known(_known({"source": "github", "repo": LEGACY_REPO}))
+        project = self.make_project({"source": "github", "repo": LEGACY_REPO})
+        result = self.run_in(project, ["env", "check"], {mps.NONESSENTIAL_TRAFFIC_ENV: "1"})
+        self.assertEqual(result["error"], "env_missing")  # not blocked
+        self.assertIn("legacy_project_source", [w["code"] for w in result["warnings"]])
+        # The lead moves the project: setup is exempt and says the lead's own machine must switch first.
+        setup = self.run_in(project, ["project", "setup"])
+        self.assertTrue(setup["ok"], setup)
+        self.assertEqual(setup["changes"], ["marketplace_source_migrated"])
+        self.assertEqual(setup["machine_source_legacy"]["marketplaces"], ["mps-cdci-agents"])
+        self.assertEqual(setup["machine_source_legacy"]["commands"][0],
+                         "claude plugin marketplace remove mps-cdci-agents")
+        # From now on the project names the shared repo, so this machine is blocked until it switches.
+        self.assertEqual(self.run_in(project, ["env", "check"])["error"], "plugin_source_legacy")
+        self.write_known(_known({"source": "github", "repo": mps.MARKETPLACE_REPO}))
+        self.assertNotIn("machine_source_legacy", self.run_in(project, ["project", "setup"]))
+        self.assertEqual(self.run_in(project, ["env", "check"], {mps.NONESSENTIAL_TRAFFIC_ENV: "1"})["error"],
+                         "env_missing")
+
+    def test_hooks_json(self):
+        with open(os.path.join(HOOKS_DIR, "hooks.json"), encoding="utf-8") as handle:
+            hooks = json.load(handle)["hooks"]
+        command = hooks["SessionStart"][0]["hooks"][0]["command"]
+        self.assertIn("${CLAUDE_PLUGIN_ROOT}/hooks/legacy-source-check.sh", command)
+
+    def test_hook_script_is_lf_and_in_sync(self):
+        data = _read_bytes(LEGACY_HOOK_SH)
+        self.assertNotIn(b"\r", data)
+        text = data.decode("utf-8")
+        self.assertIn('legacy_repo="%s"' % mps.LEGACY_MARKETPLACE_REPOS[0], text)
+        self.assertIn('shared_repo="%s"' % mps.MARKETPLACE_REPO, text)
+
+    def run_hook(self, project_settings=None):
+        project = os.path.join(self.tmp, "project")
+        os.makedirs(os.path.join(project, ".claude"), exist_ok=True)
+        if project_settings is not None:
+            with open(os.path.join(project, ".claude", "settings.json"), "w", encoding="utf-8") as handle:
+                json.dump(project_settings, handle)
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=project.replace("\\", "/"),
+                   **{mps.PLUGINS_DIR_ENV: self.tmp.replace("\\", "/")})
+        result = subprocess.run([BASH, LEGACY_HOOK_SH.replace("\\", "/")], env=env, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout.decode("utf-8").strip()
+        return json.loads(out) if out else None
+
+    @unittest.skipIf(BASH is None, "bash (Git Bash on Windows) not found")
+    def test_hook_script(self):
+        self.assertIsNone(self.run_hook())  # no registry at all
+        self.write_known(_known({"source": "github", "repo": mps.MARKETPLACE_REPO}))
+        self.assertIsNone(self.run_hook())
+        self.write_known(_known({"source": "github", "repo": LEGACY_REPO}))
+        machine = self.run_hook()
+        self.assertEqual(machine["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        self.assertIn("repo cá nhân của hungbt", machine["systemMessage"])
+        self.assertIn("/plugin marketplace remove mps-cdci-agents", machine["systemMessage"])
+        self.assertIn("plugin_source_legacy", machine["hookSpecificOutput"]["additionalContext"])
+        project = self.run_hook({"extraKnownMarketplaces": {"mps-cdci-agents": {
+            "source": {"source": "github", "repo": LEGACY_REPO}}}})
+        self.assertIn("lead", project["systemMessage"])
+        self.assertNotIn("/plugin marketplace remove", project["systemMessage"])
+        # Only a real source counts, like points_to_legacy_repo: a look-alike repo or a local folder is ignored.
+        for source in ({"source": "github", "repo": LEGACY_REPO + "-fork"},
+                       {"source": "directory", "path": "/home/me/ghq/github.com-mirror/" + LEGACY_REPO + "/x"}):
+            self.write_known(_known(source))
+            self.assertIsNone(self.run_hook(), source)
+        self.write_known(_known({"source": "git", "url": "git@github.com:hung-bui-121/mps-cdci-agents.git"}))
+        self.assertIsNotNone(self.run_hook())
 
 
 if __name__ == "__main__":

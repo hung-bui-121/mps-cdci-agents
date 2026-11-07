@@ -25,6 +25,15 @@ Speak Vietnamese, plain words, as in mps-git-flow. `GITFLOW_DIR` = `<SKILL_DIR>/
      yet; continue with step 3 and the commit in step 5.
    - Change `marketplace_source_migrated`: the marketplace pointed to the old repo `hung-bui-121/mps-cdci-agents` and
      now points to `madpoly-studio/mps-cicd-agent-flow` (a pinned `ref` is kept); say so and commit it in step 5.
+     Long-lived branches (`develop`, every open `release/*`, the production branch) each keep their own copy of the
+     file: tell the lead to run this setup on each of them (or merge the change into them), otherwise members who
+     start Claude Code on such a branch get the old repo back.
+   - `machine_source_legacy` present: the lead's own machine still installs the plugin from the old personal repo,
+     and with the new settings every other mps-git-flow command now stops with `plugin_source_legacy`. BEFORE step 5:
+     relay its `message`, and only with the lead's consent run its `commands` in order (or the lead types the
+     `/plugin ...` commands from `message`); ask for `/reload-plugins`. Then run `project setup` again: it must not
+     report `machine_source_legacy` and `.claude/settings.json` must still name the shared repo (it re-applies the
+     change if anything undid it). Only then continue.
    - Warnings: `marketplace_source_differs` (an existing, different source is kept - confirm with the lead that this
      is intended), `settings_ignored_by_git` (the lead must remove that ignore line, or members never get the file),
      `attribution_kept` (the project already sets its own attribution text; it is kept - the helper script still

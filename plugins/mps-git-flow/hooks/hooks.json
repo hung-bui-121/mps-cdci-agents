@@ -1,0 +1,17 @@
+{
+  "description": "mps-git-flow: nhắc chuyển plugin từ repo cá nhân cũ sang repo dùng chung của tổ chức",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/legacy-source-check.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

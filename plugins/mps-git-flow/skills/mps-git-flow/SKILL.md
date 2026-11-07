@@ -110,6 +110,15 @@ Install nothing else, and never change system settings beyond what this script d
 ### 1. Check the configuration
 
 Run `env check`.
+- `plugin_source_legacy` (any command can return it, except `project setup`): this machine still installs the
+  plugin from the old personal repo, and nothing else runs until it is removed. Relay `message` in friendly words
+  (the team moved the plugin to the shared repo, so the copy from hungbt's personal repo has to be removed). Offer
+  to do it: only if the user agrees, run each of `commands` in order (remove the old marketplace(s), add the shared
+  repo, install the plugin). If `claude` is not found or a command fails, give the user the `/plugin ...` commands
+  from `message` to type. Then ask them to type `/reload-plugins` (or restart Claude Code) and stop this run.
+  It can also appear in the middle of a ticket (e.g. after switching to a branch whose `.claude/settings.json`
+  already names the shared repo). Nothing is lost: after the reload, resume from the step that failed (see
+  "Resuming"); the branch and the changes are kept.
 - `env_missing` -> run `env init --open`. Tell the user the `.env` file was created (and opened, or give
   `env_path`) and that they only need to fill THREE lines: relay `fill_guide` as a short numbered list (label,
   steps, link). Say every other line already has the right default and should not be changed. They type the
@@ -136,6 +145,9 @@ Run `env check`.
     variables (e.g. `DISABLE_AUTOUPDATER`), mention that automatic updates are turned off on this machine.
     When the project pins the marketplace to a version (`"ref"` in `.claude/settings.json`), no check is made:
     `plugin_version.pinned` names the ref and `plugin_outdated` never appears.
+  - `legacy_project_source`: the project's `.claude/settings.json` still declares the plugin from the old personal
+    repo. Mention once that the lead should say "tích hợp plugin vào project" (it moves the project to the shared
+    repo) and commit the file. Never change it yourself while pushing code.
   - `project_not_integrated`: this project has not added the plugin to `.claude/settings.json`, so teammates do
     not get it (or its updates) automatically. Mention once that the project lead can say "tích hợp plugin vào
     project" (skill mps-project-setup). Never do it yourself as part of pushing code.

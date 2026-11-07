@@ -41,7 +41,7 @@ import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 USER_AGENT = "mps-git-flow/" + VERSION
 
 EXIT_FAILURE = 1
@@ -86,6 +86,13 @@ MARKETPLACE_NAME = "mps-cdci-agents"
 MARKETPLACE_REPO = "madpoly-studio/mps-cicd-agent-flow"
 # GitHub repos the marketplace used to live in. A project still pointing to one is moved to MARKETPLACE_REPO.
 LEGACY_MARKETPLACE_REPOS = ("hung-bui-121/mps-cdci-agents",)
+# Where Claude Code keeps the marketplaces registered on this machine (one file per user).
+PLUGINS_DIR_ENV = "CLAUDE_CODE_PLUGIN_CACHE_DIR"
+CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+KNOWN_MARKETPLACES_FILE = "known_marketplaces.json"
+# Commands that still run while this machine installs the plugin from a legacy repo: `project setup` is how a
+# lead moves the project to the shared repo, so it must never be locked out.
+LEGACY_SOURCE_EXEMPT_COMMANDS = (("project", "setup"),)
 PLUGIN_KEY = "mps-git-flow@mps-cdci-agents"
 PROJECT_SETTINGS_PATH = ".claude/settings.json"
 # Claude Code's `attribution` setting with every part hidden, in the form older Claude Code versions also accept
@@ -103,6 +110,9 @@ NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 FORCE_AUTOUPDATE_ENV = "FORCE_AUTOUPDATE_PLUGINS"
 PLUGIN_UPDATE_COMMANDS = ("claude plugin marketplace update " + MARKETPLACE_NAME,
                           "claude plugin update " + PLUGIN_KEY)
+# After removing every legacy marketplace: register the shared repo and install the plugin from it.
+LEGACY_SOURCE_INSTALL_COMMANDS = ("claude plugin marketplace add " + MARKETPLACE_REPO,
+                                  "claude plugin install " + PLUGIN_KEY)
 
 # Files Unity (or the IDE) rewrites on its own. They never make the current branch "hold work" for phase
 # pinning; they are still classified by the scope review and never auto-committed.
@@ -488,11 +498,10 @@ def merge_project_settings(settings):
             raise _settings_conflict("extraKnownMarketplaces." + MARKETPLACE_NAME)
         source = entry.get("source")
         unpinned = dict((k, v) for k, v in source.items() if k != "ref") if isinstance(source, dict) else source
-        legacy = (isinstance(unpinned, dict) and set(unpinned) == {"source", "repo"}
-                  and unpinned["source"] == "github" and isinstance(unpinned["repo"], str)
-                  and unpinned["repo"].lower() in LEGACY_MARKETPLACE_REPOS)  # GitHub names ignore case
-        if legacy:
-            source["repo"] = MARKETPLACE_REPO
+        if points_to_legacy_repo(unpinned):
+            # Every form the legacy check recognises is moved, so `legacy_project_source` always has a fix.
+            ref = source.get("ref")
+            entry["source"] = dict(_expected_marketplace_source(), **({"ref": ref} if ref is not None else {}))
             changes.append("marketplace_source_migrated")
         elif unpinned != _expected_marketplace_source():
             warnings.append({"code": "marketplace_source_differs", "source": source,
@@ -571,6 +580,101 @@ def pinned_marketplace_ref(settings):
     source = entry.get("source") if isinstance(entry, dict) else None
     ref = source.get("ref") if isinstance(source, dict) else None
     return ref.strip() if isinstance(ref, str) and ref.strip() else None
+
+
+def points_to_legacy_repo(source):
+    """True when a marketplace source fetches one of LEGACY_MARKETPLACE_REPOS: a `github` source with that repo or a
+    git URL ending in it (https or ssh, with or without `.git`). GitHub names ignore case."""
+    if not isinstance(source, dict):
+        return False
+    target = source.get("repo") if source.get("source") == "github" else source.get("url")
+    if not isinstance(target, str):
+        return False
+    text = target.strip().lower()
+    if text.endswith(".git"):
+        text = text[:-len(".git")]
+    return any(text == repo or text.endswith("/" + repo) or text.endswith(":" + repo)
+               for repo in LEGACY_MARKETPLACE_REPOS)
+
+
+def known_marketplaces_path(environ):
+    plugins_dir = environ.get(PLUGINS_DIR_ENV)
+    if not plugins_dir:
+        config_dir = environ.get(CLAUDE_CONFIG_DIR_ENV) or os.path.join(os.path.expanduser("~"), ".claude")
+        plugins_dir = os.path.join(config_dir, "plugins")
+    return os.path.join(plugins_dir, KNOWN_MARKETPLACES_FILE)
+
+
+def load_known_marketplaces(environ):
+    """{name: entry} of the marketplaces Claude Code registered on this machine; {} when the file is missing or
+    unreadable (an unknown state never blocks the user)."""
+    try:
+        data = json.loads(read_text_file(known_marketplaces_path(environ)))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def legacy_plugin_source_status(known, settings):
+    """(status, names) for the marketplaces of this machine that still fetch from a legacy repo.
+
+    status is None (none left), "project" (the project's .claude/settings.json itself still declares the legacy
+    repo: removing it on this machine would only bring it back, so the lead has to run `project setup` first) or
+    "machine" (this user has to remove it). names lists the legacy marketplaces, sorted.
+    """
+    names = sorted(name for name, entry in known.items()
+                   if isinstance(entry, dict) and points_to_legacy_repo(entry.get("source")))
+    if not names:
+        return None, []
+    return ("project" if project_declares_legacy_source(settings) else "machine"), names
+
+
+def project_declares_legacy_source(settings):
+    """True when the project's .claude/settings.json declares the marketplace with a legacy repo."""
+    marketplaces = settings.get("extraKnownMarketplaces") if isinstance(settings, dict) else None
+    declared = marketplaces.get(MARKETPLACE_NAME) if isinstance(marketplaces, dict) else None
+    return isinstance(declared, dict) and points_to_legacy_repo(declared.get("source"))
+
+
+def legacy_plugin_source_error(names):
+    commands = ["claude plugin marketplace remove " + name for name in names] + list(LEGACY_SOURCE_INSTALL_COMMANDS)
+    steps = ", ".join("`/plugin marketplace remove %s`" % name for name in names)
+    return MpsError(
+        "plugin_source_legacy",
+        "Team đã thống nhất đưa plugin mps-git-flow về repo dùng chung của tổ chức (%s), nên bạn cần gỡ bản cài từ "
+        "repo cá nhân của hungbt (%s) thì mới dùng tiếp được nhé. Chỉ mất khoảng một phút: trong Claude Code gõ lần "
+        "lượt %s, `/plugin marketplace add %s`, `/plugin install %s`, rồi `/reload-plugins`. Cảm ơn bạn!"
+        % (MARKETPLACE_REPO, ", ".join(LEGACY_MARKETPLACE_REPOS), steps, MARKETPLACE_REPO, PLUGIN_KEY),
+        marketplaces=names, commands=commands)
+
+
+def legacy_project_source_warning():
+    return {"code": "legacy_project_source",
+            "message": "Project này vẫn khai báo plugin mps-git-flow từ repo cá nhân cũ của hungbt (%s). Team đã "
+                       "chuyển plugin về repo dùng chung %s: nhờ lead nói \"tích hợp plugin vào project\" (lệnh "
+                       "project setup) rồi commit .claude/settings.json để cả team tự chuyển sang."
+                       % (", ".join(LEGACY_MARKETPLACE_REPOS), MARKETPLACE_REPO)}
+
+
+def _settings_of_current_project():
+    """.claude/settings.json of the project the command runs in, or None (not in a git project, missing file)."""
+    try:
+        return load_project_settings(find_project_root())
+    except MpsError:
+        return None
+
+
+def ensure_plugin_source_current(group, command, environ):
+    """Stop every command (except LEGACY_SOURCE_EXEMPT_COMMANDS) while this machine still installs the plugin from
+    a legacy repo the user can remove themselves."""
+    if (group, command) in LEGACY_SOURCE_EXEMPT_COMMANDS:
+        return
+    known = load_known_marketplaces(environ)
+    if not any(isinstance(entry, dict) and points_to_legacy_repo(entry.get("source")) for entry in known.values()):
+        return  # the usual case: no need to look for the project
+    status, names = legacy_plugin_source_status(known, _settings_of_current_project())
+    if status == "machine":
+        raise legacy_plugin_source_error(names)
 
 
 # ---------------------------------------------------------------------------
@@ -3507,6 +3611,8 @@ def cmd_env_check(args):
     version_info, warnings = _plugin_version_status(cfg, pinned_marketplace_ref(settings))
     if project_integration_status(settings) != "integrated":
         warnings.append(project_not_integrated_warning())
+    if project_declares_legacy_source(settings):
+        warnings.append(legacy_project_source_warning())
     try:
         result = _check_env(root, cfg, warnings)
     except MpsError as exc:
@@ -3645,11 +3751,19 @@ def cmd_project_setup(args):
     written = {PROJECT_SETTINGS_PATH: bool(changes), ".gitignore": gitignore_updated, PROJECT_RULES_PATH: review_written}
     pending = set(_changed_paths(git_status(root)))
     files_to_commit = [p for p in PROJECT_SETUP_FILES if written[p] or p in pending]
-    return {"settings_path": path, "created": created, "changed": bool(changes), "changes": changes,
-            "gitignore_updated": gitignore_updated, "files_to_commit": files_to_commit, "warnings": warnings,
-            "review_rules": review_rules, "review_rules_path": os.path.join(root, *PROJECT_RULES_PATH.split("/")),
-            "review_rules_problems": review_problems,
-            "next": "commit_with_mps_git_flow" if files_to_commit else None}
+    result = {"settings_path": path, "created": created, "changed": bool(changes), "changes": changes,
+              "gitignore_updated": gitignore_updated, "files_to_commit": files_to_commit, "warnings": warnings,
+              "review_rules": review_rules, "review_rules_path": os.path.join(root, *PROJECT_RULES_PATH.split("/")),
+              "review_rules_problems": review_problems,
+              "next": "commit_with_mps_git_flow" if files_to_commit else None}
+    # The settings now name the shared repo, so every other command is blocked on a machine that still installs
+    # from the legacy repo: the lead has to switch before committing these files with mps-git-flow.
+    status, names = legacy_plugin_source_status(load_known_marketplaces(os.environ), merged)
+    if status == "machine":
+        error = legacy_plugin_source_error(names)
+        result["machine_source_legacy"] = {"marketplaces": names, "commands": error.extra["commands"],
+                                           "message": error.message}
+    return result
 
 
 def _project_review_rules(root, scaffold, warnings):
@@ -5271,6 +5385,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
+        ensure_plugin_source_current(args.group, args.command, os.environ)
         result = args.handler(args)
     except MpsError as exc:
         payload = {"ok": False, "error": exc.code, "message": exc.message}
