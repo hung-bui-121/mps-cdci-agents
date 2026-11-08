@@ -56,7 +56,8 @@ The CLI is `"<SKILL_DIR>/scripts/mps.py"`; references are in `<SKILL_DIR>/refere
 | `project setup [--review-rules]` | (lead) add the plugin + auto-update to `.claude/settings.json`, make sure `.env` is git-ignored; report / scaffold `.mps/review.md` |
 | `jira get KEY` | read a ticket from ANY Jira project |
 | `jira projects` | list Jira projects (boards) the user can see, plus the configured default |
-| `jira create --type=story\|bug --summary=S --description-file=F [--project=KEY] [--field=...]` | create a ticket |
+| `jira sprints [--project=KEY]` | active sprints of the board a new ticket goes to (to ask before creating a story) |
+| `jira create --type=story\|bug --summary=S --description-file=F [--project=KEY] [--field=...] [--sprint=active\|backlog\|ID]` | create a ticket; a bug goes into the running sprint by default, a story needs `--sprint` (ask the user) |
 | `jira transition KEY --to=done\|resolved` / `jira comment KEY --body-file=F` | update a ticket |
 | `naming build --key=K --type=story\|bug\|hotfix --title=T` | branch, commit message, MR title/description |
 | `flow plan --type=story\|bug --key=K [--phase=dev\|beta\|production]` | phase from the branch holding the work; base = target |
@@ -169,9 +170,28 @@ team's board) - the ticket's project does not have to match the GitLab project.
     whether it belongs to another board (e.g. the artist board). If so, run `jira projects`, let them pick,
     and pass `--project=<KEY>` for this one ticket. Do NOT change `MPS_JIRA_PROJECT_KEY` unless the user says
     that board should become the default.
+  - Sprint (decided BEFORE creating, never changed afterwards without asking): once the board is known, run
+    `jira sprints [--project=KEY]` before showing the draft. No active sprint (empty `active_sprints`, or
+    `sprint_info_available: false`) -> say the ticket goes to the backlog, nothing to ask, omit `--sprint`.
+    - Bug -> do not ask whether: a bug goes into the running sprint. One active sprint -> say in the draft "bug sẽ
+      được đưa vào sprint <name>" and pass `--sprint=<its id>`. Several -> list them and ask WHICH one. Pass
+      `--sprint=backlog` only if the user asks for it.
+    - Story -> adding a feature to the running sprint changes that sprint's scope, so the user MUST choose. In the
+      same message as the draft, ask: put it into the running sprint (name it with its end date; list all of
+      them when there are several) or leave it in the backlog? Pass `--sprint=<id of the sprint they picked>` or
+      `--sprint=backlog` exactly as answered; never pick for them. Use the id, not `active`, so the story cannot
+      land in a sprint that started after the user answered.
   - Write the description to a file in `tmp_dir`, then
-    `jira create --type=story|bug --summary="..." --description-file=<tmp_dir>/description.txt [--project=KEY]`.
-    Assignee and reporter are set to the user automatically.
+    `jira create --type=story|bug --summary="..." --description-file=<tmp_dir>/description.txt [--project=KEY]
+    [--sprint=<id>|backlog]`. Assignee and reporter are set to the user automatically.
+  - Sprint errors (nothing has been created yet; rerun the same command with the answer):
+    `sprint_choice_required` -> a story without `--sprint` while a sprint is running: ask as above.
+    `sprint_ambiguous` -> several sprints run at once: show `active_sprints` (name, end date), let the user pick,
+    rerun with `--sprint=<id>`. `sprint_not_active` -> that sprint is no longer running (e.g. it just closed):
+    show `active_sprints` and ask again (a story: sprint or backlog; a bug: which sprint).
+  - Report where the ticket went: `placement` (`sprint` + `sprint.name`, or `backlog`). `sprint_failed: true` ->
+    the ticket exists (`key`) but the move into the sprint failed: relay the note (the user drags it into the
+    sprint on Jira); NEVER recreate the ticket.
   - `jira_project_not_found` -> the chosen board does not exist / is not visible; show `available_projects`.
   - `missing_required_fields` -> for each entry in `fields`, ask the user (offer `allowed_values` as choices),
     then retry adding `--field="<id or name>=<value>"` per field.

@@ -16,6 +16,9 @@ Each script failure has an `error` code, a Vietnamese `message` and often `servi
 | `insecure_url` | URL is not https | Fix `MPS_JIRA_URL` / `MPS_GITLAB_URL` to `https://...` |
 | `gitlab_project_unknown` | Origin is not on the MPS GitLab host | Ask for the project path, `env set MPS_GITLAB_PROJECT group/project` |
 | `gitlab_project_not_found` | Wrong path or no access | Check the path in the GitLab web UI; ask a maintainer for access |
+| `sprint_choice_required` | `jira create --type=story` without `--sprint` while a sprint is running (a story changes the sprint scope); nothing created | Ask: running sprint (`active_sprints`) or backlog; rerun with `--sprint=active` / `--sprint=backlog` |
+| `sprint_ambiguous` | Several sprints are running on the project's boards; nothing created | Show `active_sprints` (name, end date), let the user pick, rerun with `--sprint=<id>` |
+| `sprint_not_active` | `--sprint=<id>` is not a running sprint of that project; nothing created | Pick from `active_sprints` |
 | `jira_project_not_found` | Wrong `MPS_JIRA_PROJECT_KEY` (the default board for new tickets; it may differ from the GitLab project) | Pick from `available_projects`, `env set MPS_JIRA_PROJECT_KEY KEY` |
 
 `.env` is read only from the project root. Real environment variables are ignored on purpose (one project's

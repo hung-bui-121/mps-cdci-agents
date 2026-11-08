@@ -643,9 +643,11 @@ class FakeService(object):
     def __init__(self, routes):
         self.routes = routes
         self.calls = []
+        self.params = []  # (method, path, params) of every call, to check query parameters
 
     def request(self, method, path, params=None, body=None, allow_statuses=()):
         self.calls.append((method, path, body))
+        self.params.append((method, path, params))
         if (method, path) not in self.routes:
             raise AssertionError("unexpected call %s %s" % (method, path))
         status, data = self.routes[(method, path)]
@@ -737,7 +739,13 @@ def fake_gitlab(release_branches):
     })
 
 
-def fake_jira():
+SPRINT_12 = {"id": 12, "name": "Sprint 12", "state": "active", "startDate": "2026-11-02T09:00:00.000+07:00",
+             "endDate": "2026-11-15T18:00:00.000+07:00", "originBoardId": 5, "goal": "Ra mắt event"}
+SPRINT_13 = {"id": 13, "name": "Art Sprint 3", "state": "active", "originBoardId": 6}
+
+
+def fake_jira(boards=None, sprints_by_board=None, move_status=204):
+    """Jira with Story (id 10) and Bug (id 11). boards=None: no Scrum board at all; an int: the agile API refuses."""
     story_fields = [{"fieldId": "summary", "name": "Summary", "required": True},
                     {"fieldId": "assignee", "name": "Assignee", "required": False}]
     routes = {
@@ -749,8 +757,22 @@ def fake_jira():
     }
     for project in ("ART", "MPS"):
         base = "/rest/api/2/issue/createmeta/%s/issuetypes" % project
-        routes[("GET", base)] = (200, {"values": [{"id": "10", "name": "Story"}], "isLast": True})
+        routes[("GET", base)] = (200, {"values": [{"id": "10", "name": "Story"}, {"id": "11", "name": "Bug"}],
+                                       "isLast": True})
         routes[("GET", base + "/10")] = (200, {"values": story_fields, "isLast": True})
+        routes[("GET", base + "/11")] = (200, {"values": story_fields, "isLast": True})
+    if isinstance(boards, int):
+        routes[("GET", "/rest/agile/1.0/board")] = (boards, {"errorMessages": ["refused"]})
+    else:
+        routes[("GET", "/rest/agile/1.0/board")] = (200, {"values": boards or [], "isLast": True})
+    for board_id, sprints in (sprints_by_board or {}).items():
+        if isinstance(sprints, int):  # e.g. 400: "The board does not support sprints"
+            routes[("GET", "/rest/agile/1.0/board/%s/sprint" % board_id)] = (sprints, {"errorMessages": ["no"]})
+        else:
+            routes[("GET", "/rest/agile/1.0/board/%s/sprint" % board_id)] = (200, {"values": sprints,
+                                                                                  "isLast": True})
+    for sprint_id in (12, 13):
+        routes[("POST", "/rest/agile/1.0/sprint/%d/issue" % sprint_id)] = (move_status, None)
     return FakeService(routes)
 
 
@@ -1233,7 +1255,8 @@ class GitFlowTests(unittest.TestCase):
         self.write_env(MPS_JIRA_URL="https://jira.example", MPS_JIRA_PAT="x", MPS_JIRA_PROJECT_KEY="MPS")
         jira = fake_jira()
         with mock.patch.object(mps, "jira_client", return_value=jira):
-            created = self.mps("jira", "create", "--type=story", "--summary=Vẽ lại icon", "--project=art")
+            created = self.mps("jira", "create", "--type=story", "--summary=Vẽ lại icon", "--project=art",
+                               "--sprint=backlog")
             self.assertEqual((created["key"], created["project"]), ("ART-1", "ART"))
             body = [call[2] for call in jira.calls if call[0] == "POST"][0]
             self.assertEqual(body["fields"]["project"], {"key": "ART"})
@@ -1241,9 +1264,130 @@ class GitFlowTests(unittest.TestCase):
             missing = self.mps("jira", "create", "--type=story", "--summary=x", "--project=NOPE")
             self.assertEqual(missing["error"], "jira_project_not_found")
             self.assertEqual([p["key"] for p in missing["available_projects"]], ["ART", "MPS"])
-            default = self.mps("jira", "create", "--type=story", "--summary=x")
+            default = self.mps("jira", "create", "--type=story", "--summary=x", "--sprint=backlog")
             self.assertEqual(default["project"], "MPS")
             self.assertNotIn(("GET", "/rest/api/2/project/MPS", None), jira.calls)  # default is not re-validated
+
+    # -- sprint placement of new tickets -----------------------------------
+
+    def _jira_env(self):
+        self.write_env(MPS_JIRA_URL="https://jira.example", MPS_JIRA_PAT="x", MPS_JIRA_PROJECT_KEY="MPS")
+
+    def _created(self, jira):
+        return [call for call in jira.calls if call[:2] == ("POST", "/rest/api/2/issue")]
+
+    def _moves(self, jira):
+        return [(call[1], call[2]) for call in jira.calls if call[1].startswith("/rest/agile/1.0/sprint/")]
+
+    def test_bug_goes_into_the_active_sprint_automatically(self):
+        self._jira_env()
+        jira = fake_jira(boards=[{"id": 5}], sprints_by_board={5: [SPRINT_12]})
+        with mock.patch.object(mps, "jira_client", return_value=jira):
+            created = self.mps("jira", "create", "--type=bug", "--summary=Crash khi mở shop")
+        self.assertTrue(created["ok"], created)
+        self.assertEqual((created["placement"], created["sprint"]["id"], created["sprint"]["name"]),
+                         ("sprint", 12, "Sprint 12"))
+        self.assertEqual(created["sprint"]["end_date"], "2026-11-15")
+        self.assertEqual(self._moves(jira), [("/rest/agile/1.0/sprint/12/issue", {"issues": ["ART-1"]})])
+        self.assertFalse(created["sprint_failed"])
+        queries = dict(((path, method), params) for method, path, params in jira.params)
+        board_query = queries[("/rest/agile/1.0/board", "GET")]
+        self.assertEqual((board_query["projectKeyOrId"], board_query["type"]), ("MPS", "scrum"))
+        self.assertEqual(queries[("/rest/agile/1.0/board/5/sprint", "GET")]["state"], "active")
+
+    def test_sprint_of_another_board_is_not_used(self):
+        self._jira_env()
+        # An ART sprint holding one MPS issue shows up on the MPS board: it is not the MPS team's sprint.
+        foreign = dict(SPRINT_13, originBoardId=99)
+        jira = fake_jira(boards=[{"id": 5}], sprints_by_board={5: [foreign]})
+        with mock.patch.object(mps, "jira_client", return_value=jira):
+            created = self.mps("jira", "create", "--type=bug", "--summary=x")
+            self.assertEqual(created["placement"], "backlog")
+            self.assertEqual(self._moves(jira), [])
+        jira = fake_jira(boards=[{"id": 5}], sprints_by_board={5: [foreign, SPRINT_12]})
+        with mock.patch.object(mps, "jira_client", return_value=jira):
+            self.assertEqual(self.mps("jira", "create", "--type=bug", "--summary=x")["sprint"]["id"], 12)
+
+    def test_story_needs_an_explicit_choice_before_anything_is_created(self):
+        self._jira_env()
+        jira = fake_jira(boards=[{"id": 5}], sprints_by_board={5: [SPRINT_12]})
+        with mock.patch.object(mps, "jira_client", return_value=jira):
+            asked = self.mps("jira", "create", "--type=story", "--summary=Thêm event Tết")
+            self.assertEqual(asked["error"], "sprint_choice_required")
+            self.assertEqual([s["id"] for s in asked["active_sprints"]], [12])
+            self.assertIn("Sprint 12 (kết thúc 2026-11-15)", asked["message"])
+            self.assertEqual(self._created(jira), [])
+            into_sprint = self.mps("jira", "create", "--type=story", "--summary=Thêm event Tết", "--sprint=active")
+            self.assertEqual((into_sprint["placement"], into_sprint["sprint"]["id"]), ("sprint", 12))
+            jira.calls[:] = []
+            backlog = self.mps("jira", "create", "--type=story", "--summary=Thêm event Tết", "--sprint=Backlog")
+            self.assertEqual((backlog["placement"], backlog["sprint"], backlog["notes"]), ("backlog", None, []))
+            self.assertEqual([c for c in jira.calls if "/rest/agile/" in c[1]], [])  # backlog needs no agile call
+
+    def test_no_running_sprint_means_backlog_without_a_question(self):
+        self._jira_env()
+        for jira in (fake_jira(), fake_jira(boards=[{"id": 5}], sprints_by_board={5: []}),
+                     fake_jira(boards=[{"id": 5}, {"id": 7}], sprints_by_board={5: [], 7: 400})):
+            with mock.patch.object(mps, "jira_client", return_value=jira):
+                for ticket_type in ("story", "bug"):
+                    created = self.mps("jira", "create", "--type=" + ticket_type, "--summary=x")
+                    self.assertEqual((created["ok"], created["placement"]), (True, "backlog"), created)
+                    self.assertIn("không có sprint nào đang chạy", created["notes"][0])
+            self.assertEqual(self._moves(jira), [])
+
+    def test_agile_api_unavailable_falls_back_to_backlog_with_a_note(self):
+        self._jira_env()
+        # No agile API at all, or every board's sprint list refused (no permission): Jira cannot tell.
+        for jira in (fake_jira(boards=404), fake_jira(boards=[{"id": 5}], sprints_by_board={5: 403})):
+            with mock.patch.object(mps, "jira_client", return_value=jira):
+                created = self.mps("jira", "create", "--type=bug", "--summary=x")
+                self.assertEqual(created["placement"], "backlog")
+                self.assertIn("Jira Software", created["notes"][0])
+                story = self.mps("jira", "create", "--type=story", "--summary=x")
+                self.assertEqual(story["placement"], "backlog")
+                listed = self.mps("jira", "sprints")
+                self.assertEqual((listed["sprint_info_available"], listed["active_sprints"]), (False, []))
+
+    def test_parallel_sprints_ask_which_one(self):
+        self._jira_env()
+        # Board 6 also shows sprint 12 (shared filter): it is listed once.
+        jira = fake_jira(boards=[{"id": 5}, {"id": 6}], sprints_by_board={5: [SPRINT_12], 6: [SPRINT_13, SPRINT_12]})
+        with mock.patch.object(mps, "jira_client", return_value=jira):
+            for extra in ((), ("--sprint=active",)):
+                asked = self.mps("jira", "create", "--type=bug", "--summary=x", *extra)
+                self.assertEqual(asked["error"], "sprint_ambiguous")
+                self.assertEqual([s["id"] for s in asked["active_sprints"]], [12, 13])
+            self.assertEqual(self._created(jira), [])
+            wrong = self.mps("jira", "create", "--type=bug", "--summary=x", "--sprint=99")
+            self.assertEqual(wrong["error"], "sprint_not_active")
+            picked = self.mps("jira", "create", "--type=story", "--summary=x", "--sprint=13")
+            self.assertEqual(picked["sprint"]["id"], 13)
+            self.assertEqual(self._moves(jira), [("/rest/agile/1.0/sprint/13/issue", {"issues": ["ART-1"]})])
+            listed = self.mps("jira", "sprints")
+            self.assertEqual((listed["project"], [s["id"] for s in listed["active_sprints"]]), ("MPS", [12, 13]))
+
+    def test_refused_sprint_move_keeps_the_ticket_and_reports_it(self):
+        self._jira_env()
+        # 403: refused. 500: a server error after the ticket exists must not hide its key (a retry would duplicate).
+        for status in (403, 500):
+            jira = fake_jira(boards=[{"id": 5}], sprints_by_board={5: [SPRINT_12]}, move_status=status)
+            with mock.patch.object(mps, "jira_client", return_value=jira):
+                created = self.mps("jira", "create", "--type=bug", "--summary=x")
+            self.assertEqual((created["ok"], created["key"], created["placement"], created["sprint_failed"]),
+                             (True, "ART-1", "backlog", True))
+            self.assertIn("KHÔNG tạo lại ticket", created["notes"][-1])
+
+    def test_invalid_sprint_value_is_rejected(self):
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding="utf-8")
+        with mock.patch.object(sys, "stdout", stream), self.assertRaises(SystemExit):
+            mps.build_parser().parse_args(["jira", "create", "--type=bug", "--summary=x", "--sprint=next"])
+        stream.flush()
+        result = json.loads(buffer.getvalue().decode("utf-8"))
+        self.assertEqual(result["error"], "usage_error")
+        self.assertIn("sprint id", result["message"])
+        self.assertEqual(mps.parse_sprint_choice(" 12 "), 12)
+        self.assertEqual(mps.parse_sprint_choice("ACTIVE"), "active")
 
     # -- round 2: M1 scope gate, M5 exact paths ----------------------------
 

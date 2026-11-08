@@ -9,6 +9,8 @@ Jira (https://jira-mps.mto.zing.vn), kể cả khi bạn không phải developer
 1. Kiểm tra cấu hình và token (Jira, GitLab).
 2. Hỏi mã ticket Jira - ở **board nào cũng được** (ví dụ `MPS-123`, hoặc `ART-12` của board team artist) - hoặc
    giúp bạn tạo ticket mới (Story hoặc Bug) giao cho chính bạn, trên board mặc định hoặc board khác bạn chọn.
+   Bug mới được tự đưa vào sprint đang chạy; Story mới thì Claude hỏi bạn đưa vào sprint đang chạy hay để ở
+   backlog (vì thêm vào sprint làm thay đổi phạm vi sprint). Không có sprint nào đang chạy thì ticket nằm ở backlog.
 3. Nhận biết giai đoạn từ nhánh bạn đang làm (**dev** = `develop`, **beta** = `release/*`, **production** =
    `master`) và áp dụng đúng luật nhánh: **làm từ nhánh nào thì merge về đúng nhánh đó**.
 4. Đặt tên nhánh, nội dung commit, tiêu đề merge request (MR) theo chuẩn.

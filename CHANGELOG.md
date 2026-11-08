@@ -3,6 +3,16 @@
 Mỗi lần merge vào `main` phải tăng phiên bản (`VERSION` trong `mps.py` và `version` trong `plugin.json`, cùng một
 giá trị) và thêm một mục ở đây. Mục mới nhất ở trên cùng.
 
+## 0.2.3 - 2026-11-08
+- `jira create`: Bug mới được tự đưa vào sprint đang chạy của board; Story mới phải chọn `--sprint=active` hoặc
+  `--sprint=backlog` (lỗi `sprint_choice_required`, chưa tạo gì) vì thêm vào sprint làm thay đổi phạm vi sprint.
+  Nhiều sprint chạy cùng lúc: `sprint_ambiguous`, chọn bằng `--sprint=<id>`. Không có sprint đang chạy (hoặc Jira
+  không có Jira Software): ticket nằm ở backlog, kèm ghi chú. Chỉ tính sprint của chính các board Scrum của
+  project (sprint của board team khác đang chứa ticket của project bị bỏ qua). Chuyển vào sprint thất bại (bị từ
+  chối hoặc lỗi kết nối): ticket vẫn được tạo và trả về `key`, báo `sprint_failed` để không bao giờ tạo trùng.
+  Kết quả có `placement` (`sprint` / `backlog`) và `sprint`.
+- Lệnh mới `jira sprints [--project=KEY]`: liệt kê sprint đang chạy để hỏi người dùng trước khi tạo Story.
+
 ## 0.2.2 - 2026-11-07
 - Máy còn cài plugin từ repo cá nhân cũ (`hung-bui-121/mps-cdci-agents`, nhận ra qua `known_marketplaces.json`
   của Claude Code) bị chặn: mọi lệnh `mps.py` trừ `project setup` trả lỗi `plugin_source_legacy`, kèm lời nhắc

@@ -41,7 +41,7 @@ import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
 import urllib.request  # noqa: E402
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 USER_AGENT = "mps-git-flow/" + VERSION
 
 EXIT_FAILURE = 1
@@ -2458,6 +2458,69 @@ def normalize_issue_type(name):
     return JIRA_TYPE_MAP.get((name or "").strip().casefold())
 
 
+SPRINT_ACTIVE = "active"
+SPRINT_BACKLOG = "backlog"
+
+
+def parse_sprint_choice(value):
+    """argparse type for --sprint: 'active', 'backlog' or a sprint id (a positive number)."""
+    text = (value or "").strip().casefold()
+    if text in (SPRINT_ACTIVE, SPRINT_BACKLOG):
+        return text
+    if text.isdigit() and int(text) > 0:
+        return int(text)
+    raise argparse.ArgumentTypeError("must be 'active', 'backlog' or a sprint id (number), not %r" % value)
+
+
+def summarize_sprint(sprint):
+    def day(value):
+        return (value or "")[:10] or None
+    return {"id": sprint.get("id"), "name": sprint.get("name"), "start_date": day(sprint.get("startDate")),
+            "end_date": day(sprint.get("endDate")), "goal": sprint.get("goal") or None,
+            "board_id": sprint.get("originBoardId")}
+
+
+def sprint_label(sprint):
+    end = sprint.get("end_date")
+    return "%s (kết thúc %s)" % (sprint.get("name"), end) if end else str(sprint.get("name"))
+
+
+def choose_sprint(ticket_type, choice, sprints, project_key):
+    """Decide where a NEW ticket goes, before anything is created. Returns (sprint or None, note or None).
+
+    ticket_type: 'story' / 'bug'. choice: None (not given), 'active', 'backlog' or a sprint id.
+    sprints: active sprints of the project's Scrum boards, or None when Jira cannot tell (no Jira Software).
+    A bug goes into the active sprint unless the user said otherwise. A story changes the sprint's scope, so it
+    needs an explicit choice whenever there is an active sprint to put it in.
+    """
+    if choice == SPRINT_BACKLOG:
+        return None, None
+    if sprints is None:
+        return None, ("Jira không cho biết sprint đang chạy (không có Jira Software / không xem được board) nên "
+                      "ticket nằm ở backlog; nếu cần, hãy tự kéo vào sprint trên Jira.")
+    if not sprints:
+        return None, ("Project %s không có sprint nào đang chạy nên ticket nằm ở backlog." % project_key)
+    labels = ", ".join(sprint_label(s) for s in sprints)
+    if choice is None and ticket_type != "bug":
+        raise MpsError("sprint_choice_required",
+                       "Story mới làm thay đổi phạm vi sprint: hãy hỏi người dùng muốn đưa vào sprint đang chạy (%s) "
+                       "hay để ở backlog, rồi chạy lại với --sprint=active hoặc --sprint=backlog. Chưa tạo ticket nào."
+                       % labels, active_sprints=sprints)
+    if choice is None or choice == SPRINT_ACTIVE:
+        if len(sprints) == 1:
+            return sprints[0], None
+        raise MpsError("sprint_ambiguous",
+                       "Project %s có %d sprint đang chạy cùng lúc (%s). Hãy hỏi người dùng chọn sprint nào rồi chạy "
+                       "lại với --sprint=<id>. Chưa tạo ticket nào." % (project_key, len(sprints), labels),
+                       active_sprints=sprints)
+    for sprint in sprints:
+        if sprint.get("id") == choice:
+            return sprint, None
+    raise MpsError("sprint_not_active",
+                   "Sprint %s không phải sprint đang chạy của project %s. Sprint đang chạy: %s. Chưa tạo ticket nào."
+                   % (choice, project_key, labels), active_sprints=sprints)
+
+
 def is_in_target_state(status_name, category_key, target):
     name = (status_name or "").strip().casefold()
     category = (category_key or "").strip().casefold()
@@ -2871,11 +2934,18 @@ def gitlab_get_all(gitlab, path, params):
     return items
 
 
-def jira_paged_values(jira, path):
+def jira_paged_values(jira, path, params=None, allow_statuses=()):
+    """All `values` of a paged Jira endpoint. With allow_statuses, a refused FIRST page returns None."""
     values = []
     start = 0
     for _ in range(MAX_PAGES):
-        data = jira.get(path, params={"startAt": start, "maxResults": JIRA_PAGE_SIZE}) or {}
+        query = dict(params or {}, startAt=start, maxResults=JIRA_PAGE_SIZE)
+        resp = jira.request("GET", path, params=query, allow_statuses=allow_statuses)
+        if resp.status in allow_statuses:
+            if start == 0:
+                return None
+            break
+        data = resp.data or {}
         batch = data.get("values") or []
         values.extend(batch)
         start += len(batch)
@@ -3536,6 +3606,49 @@ def load_create_meta(jira, project_key, type_name):
     return issue_type, normalize_field_meta_map(issue_type.get("fields")), "createmeta_legacy"
 
 
+_AGILE_REFUSED = (400, 401, 403, 404)
+
+
+def find_active_sprints(jira, project_key):
+    """Active sprints on the Scrum boards of a project, deduplicated and sorted by id.
+
+    None = Jira cannot tell (Jira Software agile API missing, or every board's sprint list refused). Kanban boards
+    have no sprints. A board also lists another board's sprint when one of its issues sits there; such a sprint
+    (originBoardId not one of the project's own Scrum boards) belongs to another team and is left out.
+    """
+    boards = jira_paged_values(jira, "/rest/agile/1.0/board", params={"projectKeyOrId": project_key, "type": "scrum"},
+                               allow_statuses=_AGILE_REFUSED)
+    if boards is None:
+        return None
+    board_ids = set(board.get("id") for board in boards if board.get("id") is not None)
+    found = {}
+    refused = 0
+    for board_id in sorted(board_ids):
+        sprints = jira_paged_values(jira, "/rest/agile/1.0/board/%s/sprint" % board_id,
+                                    params={"state": "active"}, allow_statuses=_AGILE_REFUSED)
+        if sprints is None:
+            refused += 1
+            continue
+        for sprint in sprints:
+            origin = sprint.get("originBoardId")
+            if (sprint.get("state") or "active").casefold() == "active" and sprint.get("id") is not None \
+                    and (origin is None or origin in board_ids):
+                found.setdefault(sprint.get("id"), summarize_sprint(sprint))
+    if board_ids and refused == len(board_ids):
+        return None
+    return [found[key] for key in sorted(found)]
+
+
+def move_issue_to_sprint(jira, key, sprint):
+    """True when Jira accepted the move. Never raises: the ticket already exists, an error must not hide its key."""
+    try:
+        resp = jira.request("POST", "/rest/agile/1.0/sprint/%s/issue" % sprint.get("id"), body={"issues": [key]},
+                            allow_statuses=_AGILE_REFUSED)
+    except MpsError:
+        return False
+    return resp.status in (200, 201, 204)
+
+
 def read_text_arg(value, file_path, label):
     if file_path:
         try:
@@ -3836,19 +3949,25 @@ def ensure_jira_project_exists(jira, project_key):
     return {"key": resp.data.get("key"), "name": resp.data.get("name")}
 
 
+def resolve_create_project(cfg, override):
+    """(project key, Jira client) for a NEW ticket; a one-off --project is checked to exist."""
+    cfg.require(KEY_JIRA_PROJECT)
+    project_key = choose_create_project(override, cfg.get(KEY_JIRA_PROJECT))
+    jira = jira_client(cfg)
+    if project_key != cfg.get(KEY_JIRA_PROJECT).upper():
+        ensure_jira_project_exists(jira, project_key)
+    return project_key, jira
+
+
 def cmd_jira_create(args):
     cfg = load_config(find_project_root())
-    cfg.require(KEY_JIRA_PROJECT)
-    project_key = choose_create_project(args.project, cfg.get(KEY_JIRA_PROJECT))
     summary = " ".join((args.summary or "").split())
     if not summary:
         raise MpsError("empty_summary", "Tiêu đề (summary) ticket đang trống.")
     if len(summary) > JIRA_SUMMARY_MAX_LEN:
         raise MpsError("summary_too_long", "Tiêu đề ticket dài quá %d ký tự." % JIRA_SUMMARY_MAX_LEN)
     description = read_text_arg(args.description, args.description_file, "mô tả")
-    jira = jira_client(cfg)
-    if project_key != cfg.get(KEY_JIRA_PROJECT).upper():
-        ensure_jira_project_exists(jira, project_key)
+    project_key, jira = resolve_create_project(cfg, args.project)
     me = jira.get("/rest/api/2/myself") or {}
     type_name = "Story" if args.type == "story" else "Bug"
     issue_type, fields_meta, meta_source = load_create_meta(jira, project_key, type_name)
@@ -3858,6 +3977,10 @@ def cmd_jira_create(args):
         raise MpsError("missing_required_fields", "Jira yêu cầu thêm thông tin trước khi tạo ticket. Hãy hỏi người dùng "
                                                   "từng trường rồi chạy lại với --field \"<tên>=<giá trị>\".",
                        fields=missing)
+    # Decided before the ticket exists, so a question for the user never leaves a half-made ticket behind.
+    sprints = None if args.sprint == SPRINT_BACKLOG else find_active_sprints(jira, project_key)
+    sprint, sprint_note = choose_sprint(args.type, args.sprint, sprints, project_key)
+    notes = [sprint_note] if sprint_note else []
     fields = {"project": {"key": project_key}, "issuetype": {"id": str(issue_type.get("id"))},
               "summary": summary, "description": description}
     fields.update(provided)
@@ -3866,7 +3989,6 @@ def cmd_jira_create(args):
         fields["assignee"] = {"name": me.get("name")}
     if "reporter" in fields_meta:
         fields["reporter"] = {"name": me.get("name")}
-    notes = []
     resp = jira.request("POST", "/rest/api/2/issue", body={"fields": fields}, allow_statuses=(400,))
     errors = (resp.data or {}).get("errors") if isinstance(resp.data, dict) else None
     if resp.status == 400 and "reporter" in fields and isinstance(errors, dict) and "reporter" in errors:
@@ -3877,16 +3999,34 @@ def cmd_jira_create(args):
         raise MpsError("jira_create_failed", "Jira từ chối tạo ticket. Xem chi tiết lỗi để biết trường nào sai.",
                        details=extract_server_message(resp.data), field_errors=(resp.data or {}).get("errors"))
     key = resp.data.get("key")
+    # From here on the ticket exists: nothing may raise, or the key is lost and a retry makes a duplicate.
     if not assignee_on_screen:
-        assign = jira.request("PUT", "/rest/api/2/issue/%s/assignee" % urllib.parse.quote(key),
-                              body={"name": me.get("name")}, allow_statuses=(400, 401, 403, 404))
-        if assign.status in (200, 204):
+        try:
+            assigned = jira.request("PUT", "/rest/api/2/issue/%s/assignee" % urllib.parse.quote(key),
+                                    body={"name": me.get("name")},
+                                    allow_statuses=(400, 401, 403, 404)).status in (200, 204)
+        except MpsError:
+            assigned = False
+        if assigned:
             notes.append("Đã giao ticket cho bạn sau khi tạo.")
         else:
             notes.append("Ticket đã tạo nhưng chưa giao (assign) được cho bạn; hãy tự giao trên Jira.")
+    sprint_failed = False
+    if sprint is not None and not move_issue_to_sprint(jira, key, sprint):
+        notes.append("Ticket %s đã tạo nhưng chưa đưa được vào sprint %s (Jira từ chối hoặc lỗi kết nối), nên đang "
+                     "nằm ở backlog; hãy tự kéo vào sprint trên Jira, KHÔNG tạo lại ticket." % (key, sprint_label(sprint)))
+        sprint, sprint_failed = None, True
     return {"key": key, "url": cfg.get(KEY_JIRA_URL).rstrip("/") + "/browse/" + key, "issue_type": args.type,
             "project": project_key, "summary": summary, "assignee": me.get("name"), "createmeta_source": meta_source,
-            "notes": notes}
+            "sprint": sprint, "placement": "sprint" if sprint is not None else SPRINT_BACKLOG,
+            "sprint_failed": sprint_failed, "notes": notes}
+
+
+def cmd_jira_sprints(args):
+    """Active sprints of the board a new ticket would go to, so the user can be asked before `jira create`."""
+    project_key, jira = resolve_create_project(load_config(find_project_root()), args.project)
+    sprints = find_active_sprints(jira, project_key)
+    return {"project": project_key, "sprint_info_available": sprints is not None, "active_sprints": sprints or []}
 
 
 def cmd_jira_transition(args):
@@ -5298,7 +5438,13 @@ def build_parser():
     p.add_argument("--field", action="append", default=[], metavar="NAME=VALUE",
                    help="extra field by id or name (repeatable); JSON values allowed")
     p.add_argument("--project", help="one-off Jira project key (e.g. the artist board); default MPS_JIRA_PROJECT_KEY")
+    p.add_argument("--sprint", type=parse_sprint_choice, metavar="active|backlog|ID",
+                   help="bug: default active (the running sprint); story: required when a sprint is running "
+                        "(ask the user, it changes the sprint scope)")
     p.set_defaults(handler=cmd_jira_create)
+    p = jira.add_parser("sprints", help="active sprints of the board a new ticket goes to")
+    p.add_argument("--project", help="one-off Jira project key; default MPS_JIRA_PROJECT_KEY")
+    p.set_defaults(handler=cmd_jira_sprints)
     p = jira.add_parser("projects", help="list Jira projects (boards) you can see")
     p.set_defaults(handler=cmd_jira_projects)
     p = jira.add_parser("transition", help="move a ticket to done/resolved")
